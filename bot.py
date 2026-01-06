@@ -28,6 +28,14 @@ def log_info(message: str):
 def log_error(message: str):
     executor_log.submit(logger.error, message)
 
+def log_debug(message: str):
+    """Логи для отладки"""
+    executor_log.submit(logger.debug, message)
+
+def log_warning(message: str):
+    """Логи для предупреждений"""
+    executor_log.submit(logger.warning, message)
+
 # --- TOKEN ---
 load_dotenv()
 API_TOKEN = os.getenv("BOT_TOKEN")
@@ -39,10 +47,55 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
 USERS_FILE = "users.json"
+ASSIGNMENTS_FILE = "assignments.json"  # НОВЫЙ ФАЙЛ ДЛЯ ЗАДАНИЙ
 LEVELS_ORDER = ["НП", "СВ", "ВТ", "АВТ", "ГТ"]
 OLGA_ID = 64434196
 YOUR_ADMIN_ID = 911511438
 REPORT_GROUP_ID = "-1003632130674"
+
+# --- Функция для разбивки длинных сообщений на части ---
+async def safe_send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
+    """Безопасная отправка сообщений с разбивкой на части"""
+    if len(text) <= 4096:
+        # Если сообщение короткое, отправляем как есть
+        await bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    else:
+        # Разбиваем на части по 4000 символов (с запасом)
+        parts = []
+        current_part = ""
+        
+        # Разбиваем по строкам, чтобы не обрезать слова
+        lines = text.split('\n')
+        
+        for line in lines:
+            # Если добавление строки не превысит лимит
+            if len(current_part) + len(line) + 1 <= 4000:
+                current_part += line + '\n'
+            else:
+                # Сохраняем текущую часть и начинаем новую
+                if current_part:
+                    parts.append(current_part)
+                current_part = line + '\n'
+        
+        # Добавляем последнюю часть
+        if current_part:
+            parts.append(current_part)
+        
+        # Отправляем все части
+        for i, part in enumerate(parts):
+            if i == 0 and reply_markup is not None:
+                # Клавиатуру добавляем только к первой части
+                await bot.send_message(chat_id, part, reply_markup=reply_markup, parse_mode=parse_mode)
+            else:
+                await bot.send_message(chat_id, part, parse_mode=parse_mode)
+            
+            # Небольшая задержка между отправками
+            if i < len(parts) - 1:
+                await asyncio.sleep(0.1)
+        
+        # Уведомляем, если сообщение было разбито
+        if len(parts) > 1:
+            await bot.send_message(chat_id, f"📄 *Сообщение разбито на {len(parts)} части*", parse_mode="Markdown")
 
 # --- УЛУЧШЕННАЯ БЕЗОПАСНАЯ ЗАГРУЗКА И СОХРАНЕНИЕ ---
 def recover_corrupted_file():
@@ -220,6 +273,29 @@ def save_users(data):
         
         return False
 
+# --- ФУНКЦИИ ДЛЯ РАБОТЫ С ЗАДАНИЯМИ ---
+def load_assignments():
+    """Загрузка заданий и решений"""
+    if not os.path.exists(ASSIGNMENTS_FILE):
+        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
+    
+    try:
+        with open(ASSIGNMENTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log_error(f"❌ Ошибка загрузки assignments.json: {e}")
+        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
+
+def save_assignments(data):
+    """Сохранение заданий"""
+    try:
+        with open(ASSIGNMENTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        log_error(f"❌ Ошибка сохранения assignments.json: {e}")
+        return False
+
 # --- МЕНЮ КОМАНД ---
 async def set_bot_commands():
     commands = [
@@ -258,6 +334,13 @@ class Form(StatesGroup):
     sending = State()
     admin_message = State()
     admin_choose_levels = State()
+    change_level = State()            # Для смены уровня
+    change_mentor = State()           # Для смены наставника
+
+# НОВЫЕ СОСТОЯНИЯ ДЛЯ ЗАДАНИЙ
+class AssignmentStates(StatesGroup):
+    waiting_for_solution = State()  # Ученик отправляет решение
+    mentor_reply = State()          # Наставник отвечает ученику
 
 # --- АДМИН МЕНЮ ---
 async def admin_main_menu(user_id):
@@ -373,7 +456,8 @@ async def admin_activity(callback):
     text += f"\n\n<b>❌ Не активны ({len(inactive_users)}):</b>\n"
     text += ", ".join(inactive_users) if inactive_users else "—"
     
-    await callback.message.answer(text[:4000])
+    # Используем безопасную отправку
+    await safe_send_message(callback.from_user.id, text)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_new_today")
 async def admin_new_today(callback):
@@ -404,7 +488,8 @@ async def admin_new_today(callback):
     else:
         text += "Сегодня новых пользователей не зарегистрировано."
     
-    await callback.message.answer(text)
+    # Используем безопасную отправку
+    await safe_send_message(callback.from_user.id, text)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_search")
 async def admin_search(callback):
@@ -481,14 +566,27 @@ async def fix_data_command(message: types.Message, state=None):
 
 # --- BUTTON: ОБЫЧНОЕ МЕНЮ НАСТАВНИКА ---
 async def mentor_main_menu(user_id):
-    if user_id in [OLGA_ID, YOUR_ADMIN_ID]:
+    data = load_users()
+    users = data["users"]
+    
+    # Проверяем, есть ли ученики или является ли админом
+    has_students = any(u.get("mentor") == str(user_id) for u in users.values())
+    is_admin = user_id in [OLGA_ID, YOUR_ADMIN_ID]
+    
+    # Если это админ Ольга, показываем ей обе роли
+    if is_admin and user_id == OLGA_ID:
         await admin_main_menu(user_id)
         return
     
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"))
-    kb.add(InlineKeyboardButton("👥 Мои ученики", callback_data="show_my_students"))
-    await bot.send_message(user_id, "Ваши функции наставника:", reply_markup=kb)
+    
+    if has_students or is_admin:
+        kb.add(InlineKeyboardButton("👥 Мои ученики", callback_data="show_my_students"))
+        # ДОБАВЛЕНО: Кнопка для просмотра решений учеников
+        kb.add(InlineKeyboardButton("📥 Ответы учеников", callback_data="view_student_solutions"))
+    
+    await bot.send_message(user_id, "📋 <b>Главное меню</b>", reply_markup=kb)
 
 # --- КОМАНДЫ МЕНЮ ---
 @dp.message_handler(commands=["help"], state="*")
@@ -518,11 +616,15 @@ async def help_command(message: types.Message, state=None):
 <b>Для наставников:</b>
 • Вы можете просматривать своих учеников
 • Подтверждать заявки новых учеников
+• Изменять свой уровень (требуется подтверждение наставника)
+• Изменять наставника (требуется подтверждение нового наставника)
+• Просматривать решения заданий от своих учеников
 
 <b>Для администраторов:</b>
 • Доступны дополнительные команды (/admin, /stats, /broadcast, /check_data, /fix_data)
 • Управление статистикой и рассылками
 • Проверка и исправление данных
+• Отправка заданий ученикам через рассылку
     """
     await message.answer(help_text)
 
@@ -595,7 +697,11 @@ async def profile_command(message: types.Message, state=None):
     if message.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]:
         text += f"• Ваш ID: <b>{user_id}</b>"
     
-    kb = InlineKeyboardMarkup()
+    kb = InlineKeyboardMarkup(row_width=2)
+    # Добавляем кнопки для изменения данных (только для обычных пользователей, не суперадмина)
+    if message.from_user.id != YOUR_ADMIN_ID:
+        kb.add(InlineKeyboardButton("🔄 Изменить наставника", callback_data="change_mentor_btn"))
+        kb.add(InlineKeyboardButton("📊 Изменить уровень", callback_data="change_level_btn"))
     kb.add(InlineKeyboardButton("⬅ Назад в меню", callback_data="back_main"))
     await message.answer(text, reply_markup=kb)
 
@@ -610,27 +716,35 @@ async def students_command(message: types.Message, state=None):
     
     today_str = str(date.today())
     
+    is_admin = user_id in [OLGA_ID, YOUR_ADMIN_ID]
+    
+    if not is_admin and str(user_id) not in users:
+        await message.answer("Вы не зарегистрированы. Используйте /start для регистрации.")
+        return
+    
     if str(user_id) in users:
         users[str(user_id)]["active_today"] = today_str
         save_users(data)
-    else:
-        await message.answer("Вы не зарегистрированы. Используйте /start для регистрации.")
-        return
     
     has_students = any(u.get("mentor") == str(user_id) for u in users.values())
     
     kb = InlineKeyboardMarkup(row_width=2)
     
     for lvl in LEVELS_ORDER:
-        kb.add(InlineKeyboardButton(lvl, callback_data=f"show_students:{lvl}"))
+        if is_admin or has_students:
+            kb.add(InlineKeyboardButton(lvl, callback_data=f"show_students:{lvl}"))
     
-    # Для админа всегда показываем "Вся ветка", для остальных - только если есть ученики
-    if user_id == YOUR_ADMIN_ID or (user_id != YOUR_ADMIN_ID and has_students):
+    if is_admin or (not is_admin and has_students):
         kb.add(InlineKeyboardButton("🌳 Вся моя ветка", callback_data="my_full_branch"))
     
     kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_main"))
     
-    await message.answer("Выберите уровень или просмотр ветки:", reply_markup=kb)
+    if is_admin:
+        await message.answer("👑 <b>Администраторская панель учеников</b>\nВыберите уровень или просмотр ветки:", reply_markup=kb)
+    elif has_students:
+        await message.answer("Выберите уровень или просмотр ветки:", reply_markup=kb)
+    else:
+        await message.answer("У вас пока нет учеников.", reply_markup=kb)
 
 @dp.message_handler(commands=["admin"], state="*")
 async def admin_command(message: types.Message, state=None):
@@ -804,7 +918,7 @@ async def choose_mentor_level(callback, state):
     mentors = [
         (uid, u) for uid, u in users.items() 
         if u.get("level") == level 
-        and int(uid) != YOUR_ADMIN_ID
+        and int(uid) != YOUR_ADMIN_ID  # Исключаем суперадмина
     ]
 
     if not mentors:
@@ -908,7 +1022,13 @@ async def mentor_accept(callback):
     await callback.message.edit_text(
         f"Вы приняли ученика <b>{users[chosen_user_id]['name']} {users[chosen_user_id].get('surname','')}</b>"
     )
-    await mentor_main_menu(mentor_id)
+    
+    # Для Ольги - показываем админ-меню, для остальных - обычное меню наставника
+    if mentor_id == str(OLGA_ID) or mentor_id == str(YOUR_ADMIN_ID):
+        await admin_main_menu(int(mentor_id))
+    else:
+        await mentor_main_menu(int(mentor_id))
+        
     await bot.send_message(chosen_user_id, "Наставник подтвердил ваш выбор ✅")
 
 @dp.callback_query_handler(lambda c: c.data.startswith("mentor_decline:"))
@@ -925,6 +1045,357 @@ async def mentor_decline(callback):
 
     await callback.message.edit_text("Отказано.")
     await bot.send_message(chosen_user_id, "Наставник отклонил ваш выбор.")
+
+# --- ИЗМЕНЕНИЕ НАСТАВНИКА ---
+@dp.callback_query_handler(lambda c: c.data == "change_mentor_btn")
+async def change_mentor_btn(callback):
+    user_id = str(callback.from_user.id)
+    data = load_users()
+    users = data["users"]
+    
+    if user_id not in users:
+        await callback.answer("Вы не зарегистрированы", show_alert=True)
+        return
+    
+    # Проверяем, есть ли текущий наставник
+    if not users[user_id].get("mentor"):
+        await callback.answer("У вас нет наставника для изменения", show_alert=True)
+        return
+    
+    await callback.message.answer("Выберите уровень нового наставника:")
+    await Form.change_mentor.set()
+    
+    # Показываем только уровни, которые выше или равны текущему
+    current_level = users[user_id].get("level", "НП")
+    current_level_idx = LEVELS_ORDER.index(current_level) if current_level in LEVELS_ORDER else 0
+    available_levels = LEVELS_ORDER[current_level_idx:]
+    
+    kb = InlineKeyboardMarkup()
+    for lvl in available_levels:
+        kb.add(InlineKeyboardButton(lvl, callback_data=f"change_mentor_level:{lvl}"))
+    
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_change"))
+    
+    await callback.message.answer("Выберите уровень наставника (только равный или выше вашего текущего уровня):", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("change_mentor_level:"), state=Form.change_mentor)
+async def change_mentor_level(callback, state):
+    level = callback.data.split(":")[1]
+    await state.update_data(new_mentor_level=level)
+    
+    data_users = load_users()
+    users = data_users["users"]
+    user_id = str(callback.from_user.id)
+    
+    # Исключаем текущего наставника и суперадмина
+    current_mentor = users[user_id].get("mentor")
+    
+    mentors = [
+        (uid, u) for uid, u in users.items() 
+        if u.get("level") == level 
+        and int(uid) != YOUR_ADMIN_ID  # Исключаем суперадмина
+        and uid != current_mentor  # Исключаем текущего наставника
+        and uid != user_id  # Исключаем самого себя
+    ]
+
+    if not mentors:
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("⬅ Назад", callback_data="change_mentor_btn"))
+        await callback.message.answer("Нет наставников на этом уровне.", reply_markup=kb)
+        return
+
+    kb = InlineKeyboardMarkup()
+    for uid, u in sorted(mentors, key=lambda x: x[1]["name"]):
+        full_name = f"{u['name']} {u.get('surname','')}".strip()
+        kb.add(InlineKeyboardButton(f"{full_name} — {u['level']}", callback_data=f"select_new_mentor:{uid}"))
+    
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_change"))
+    
+    await callback.message.answer("Выберите нового наставника:", reply_markup=kb)
+    await callback.message.delete()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("select_new_mentor:"), state=Form.change_mentor)
+async def select_new_mentor(callback, state):
+    new_mentor_id = callback.data.split(":")[1]
+    user_id = str(callback.from_user.id)
+    
+    data = load_users()
+    users = data["users"]
+    
+    if user_id not in users:
+        await callback.answer("Ошибка: пользователь не найден", show_alert=True)
+        return
+    
+    # Сохраняем данные о запросе
+    users[user_id]["pending_new_mentor"] = new_mentor_id
+    users[user_id]["mentor_change_request"] = str(datetime.now())
+    
+    if not save_users(data):
+        await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
+        return
+    
+    user_name = f"{users[user_id]['name']} {users[user_id].get('surname','')}".strip()
+    
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("✅ Принять", callback_data=f"accept_new_mentor:{user_id}"))
+    kb.add(InlineKeyboardButton("❌ Отклонить", callback_data=f"decline_new_mentor:{user_id}"))
+    
+    await bot.send_message(
+        new_mentor_id,
+        f"<b>Запрос на смену наставника</b>\n\n"
+        f"Пользователь <b>{user_name}</b> хочет выбрать вас своим новым наставником.\n"
+        f"Текущий уровень пользователя: <b>{users[user_id].get('level','—')}</b>\n\n"
+        f"Вы согласны стать наставником этого пользователя?",
+        reply_markup=kb
+    )
+    
+    await callback.message.answer(f"Запрос на смену наставника отправлен. Ожидайте подтверждения.")
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("accept_new_mentor:"))
+async def accept_new_mentor(callback):
+    user_id = callback.data.split(":")[1]
+    new_mentor_id = str(callback.from_user.id)
+    
+    data = load_users()
+    users = data["users"]
+    
+    if user_id not in users:
+        await callback.answer("Ошибка: пользователь не найден", show_alert=True)
+        return
+    
+    # Проверяем, что запрос еще актуален
+    if users[user_id].get("pending_new_mentor") != new_mentor_id:
+        await callback.answer("Запрос устарел или недействителен", show_alert=True)
+        return
+    
+    # Сохраняем старого наставника для уведомления
+    old_mentor_id = users[user_id].get("mentor")
+    
+    # Меняем наставника
+    users[user_id]["mentor"] = new_mentor_id
+    users[user_id].pop("pending_new_mentor", None)
+    users[user_id].pop("mentor_change_request", None)
+    
+    if not save_users(data):
+        await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
+        return
+    
+    user_name = f"{users[user_id]['name']} {users[user_id].get('surname','')}".strip()
+    
+    # Уведомляем нового наставника
+    await callback.message.edit_text(f"✅ Вы приняли пользователя <b>{user_name}</b> как своего ученика.")
+    
+    # Уведомляем ученика
+    new_mentor_name = f"{users[new_mentor_id]['name']} {users[new_mentor_id].get('surname','')}".strip()
+    await bot.send_message(user_id, f"✅ Наставник <b>{new_mentor_name}</b> принял ваш запрос на смену наставника.")
+    
+    # Уведомляем старого наставника (если был)
+    if old_mentor_id and old_mentor_id in users:
+        old_mentor_name = f"{users[old_mentor_id]['name']} {users[old_mentor_id].get('surname','')}".strip()
+        await bot.send_message(old_mentor_id, f"ℹ️ Ваш ученик <b>{user_name}</b> сменил наставника на <b>{new_mentor_name}</b>.")
+    
+    log_info(f"Пользователь {user_id} ({user_name}) сменил наставника с {old_mentor_id} на {new_mentor_id}")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("decline_new_mentor:"))
+async def decline_new_mentor(callback):
+    user_id = callback.data.split(":")[1]
+    declined_mentor_id = str(callback.from_user.id)
+    
+    data = load_users()
+    users = data["users"]
+    
+    if user_id not in users:
+        await callback.answer("Ошибка: пользователь не найден", show_alert=True)
+        return
+    
+    # Проверяем, что запрос еще актуален
+    if users[user_id].get("pending_new_mentor") != declined_mentor_id:
+        await callback.answer("Запрос устарел или недействителен", show_alert=True)
+        return
+    
+    # Удаляем запрос
+    users[user_id].pop("pending_new_mentor", None)
+    users[user_id].pop("mentor_change_request", None)
+    
+    if not save_users(data):
+        await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
+        return
+    
+    user_name = f"{users[user_id]['name']} {users[user_id].get('surname','')}".strip()
+    
+    # Уведомляем наставника, который отклонил
+    await callback.message.edit_text(f"❌ Вы отклонили запрос от пользователя <b>{user_name}</b>.")
+    
+    # Уведомляем ученика
+    declined_mentor_name = f"{users[declined_mentor_id]['name']} {users[declined_mentor_id].get('surname','')}".strip()
+    await bot.send_message(user_id, f"❌ Наставник <b>{declined_mentor_name}</b> отклонил ваш запрос на смену наставника.")
+
+# --- ИЗМЕНЕНИЕ УРОВНЯ ---
+@dp.callback_query_handler(lambda c: c.data == "change_level_btn")
+async def change_level_btn(callback):
+    user_id = str(callback.from_user.id)
+    data = load_users()
+    users = data["users"]
+    
+    if user_id not in users:
+        await callback.answer("Вы не зарегистрированы", show_alert=True)
+        return
+    
+    # Проверяем, есть ли текущий наставник
+    if not users[user_id].get("mentor"):
+        await callback.answer("Для смены уровня требуется наличие наставника", show_alert=True)
+        return
+    
+    await callback.message.answer("Выберите новый уровень:")
+    await Form.change_level.set()
+    
+    # Показываем все уровни (можно менять на любой)
+    kb = InlineKeyboardMarkup()
+    for lvl in LEVELS_ORDER:
+        kb.add(InlineKeyboardButton(lvl, callback_data=f"select_new_level:{lvl}"))
+    
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_change"))
+    
+    current_level = users[user_id].get("level", "—")
+    await callback.message.answer(f"Ваш текущий уровень: <b>{current_level}</b>\nВыберите новый уровень:", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("select_new_level:"), state=Form.change_level)
+async def select_new_level(callback, state):
+    new_level = callback.data.split(":")[1]
+    user_id = str(callback.from_user.id)
+    
+    data = load_users()
+    users = data["users"]
+    
+    if user_id not in users:
+        await callback.answer("Ошибка: пользователь не найден", show_alert=True)
+        return
+    
+    current_level = users[user_id].get("level", "—")
+    
+    # Если уровень не изменился
+    if new_level == current_level:
+        await callback.answer("Вы выбрали тот же уровень", show_alert=True)
+        return
+    
+    # Сохраняем запрос на изменение уровня
+    users[user_id]["pending_level"] = new_level
+    users[user_id]["level_change_request"] = str(datetime.now())
+    
+    if not save_users(data):
+        await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
+        return
+    
+    user_name = f"{users[user_id]['name']} {users[user_id].get('surname','')}".strip()
+    mentor_id = users[user_id].get("mentor")
+    
+    if mentor_id and mentor_id in users:
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_level:{user_id}:{new_level}"))
+        kb.add(InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_level:{user_id}"))
+        
+        await bot.send_message(
+            mentor_id,
+            f"<b>Запрос на смену уровня</b>\n\n"
+            f"Ваш ученик <b>{user_name}</b> запрашивает смену уровня.\n"
+            f"Текущий уровень: <b>{current_level}</b>\n"
+            f"Новый уровень: <b>{new_level}</b>\n\n"
+            f"Вы подтверждаете смену уровня?",
+            reply_markup=kb
+        )
+        
+        await callback.message.answer(f"Запрос на смену уровня отправлен вашему наставнику. Ожидайте подтверждения.")
+    else:
+        await callback.answer("Ошибка: наставник не найден", show_alert=True)
+    
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("confirm_level:"))
+async def confirm_level(callback):
+    parts = callback.data.split(":")
+    user_id = parts[1]
+    new_level = parts[2]
+    mentor_id = str(callback.from_user.id)
+    
+    data = load_users()
+    users = data["users"]
+    
+    if user_id not in users:
+        await callback.answer("Ошибка: пользователь не найден", show_alert=True)
+        return
+    
+    # Проверяем, что запрос еще актуален и что это действительно наставник
+    if users[user_id].get("mentor") != mentor_id:
+        await callback.answer("Вы не являетесь наставником этого пользователя", show_alert=True)
+        return
+    
+    if users[user_id].get("pending_level") != new_level:
+        await callback.answer("Запрос устарел или недействителен", show_alert=True)
+        return
+    
+    # Меняем уровень
+    old_level = users[user_id].get("level", "—")
+    users[user_id]["level"] = new_level
+    users[user_id].pop("pending_level", None)
+    users[user_id].pop("level_change_request", None)
+    
+    if not save_users(data):
+        await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
+        return
+    
+    user_name = f"{users[user_id]['name']} {users[user_id].get('surname','')}".strip()
+    
+    # Уведомляем наставника
+    await callback.message.edit_text(f"✅ Вы подтвердили смену уровня для <b>{user_name}</b> с {old_level} на {new_level}.")
+    
+    # Уведомляем ученика
+    mentor_name = f"{users[mentor_id]['name']} {users[mentor_id].get('surname','')}".strip()
+    await bot.send_message(user_id, f"✅ Ваш наставник <b>{mentor_name}</b> подтвердил смену уровня.\nВаш новый уровень: <b>{new_level}</b>")
+    
+    log_info(f"Пользователь {user_id} ({user_name}) сменил уровень с {old_level} на {new_level}")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("reject_level:"))
+async def reject_level(callback):
+    user_id = callback.data.split(":")[1]
+    mentor_id = str(callback.from_user.id)
+    
+    data = load_users()
+    users = data["users"]
+    
+    if user_id not in users:
+        await callback.answer("Ошибка: пользователь не найден", show_alert=True)
+        return
+    
+    # Проверяем, что это действительно наставник
+    if users[user_id].get("mentor") != mentor_id:
+        await callback.answer("Вы не являетесь наставником этого пользователя", show_alert=True)
+        return
+    
+    # Удаляем запрос
+    new_level = users[user_id].get("pending_level", "—")
+    users[user_id].pop("pending_level", None)
+    users[user_id].pop("level_change_request", None)
+    
+    if not save_users(data):
+        await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
+        return
+    
+    user_name = f"{users[user_id]['name']} {users[user_id].get('surname','')}".strip()
+    
+    # Уведомляем наставника
+    await callback.message.edit_text(f"❌ Вы отклонили смену уровня для <b>{user_name}</b>.")
+    
+    # Уведомляем ученика
+    mentor_name = f"{users[mentor_id]['name']} {users[mentor_id].get('surname','')}".strip()
+    await bot.send_message(user_id, f"❌ Ваш наставник <b>{mentor_name}</b> отклонил смену уровня на <b>{new_level}</b>.")
+
+# --- ОБЩИЙ ОБРАБОТЧИК ОТМЕНЫ ---
+@dp.callback_query_handler(lambda c: c.data == "cancel_change", state=[Form.change_level, Form.change_mentor])
+async def cancel_change(callback, state):
+    await state.finish()
+    await callback.message.answer("❌ Изменение отменено.")
+    await callback.message.delete()
 
 # --- Кнопка "Мой профиль" ---
 @dp.callback_query_handler(lambda c: c.data == "my_profile")
@@ -966,7 +1437,11 @@ async def show_my_profile(callback):
     if callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]:
         text += f"• Ваш ID: <b>{user_id}</b>"
     
-    kb = InlineKeyboardMarkup()
+    kb = InlineKeyboardMarkup(row_width=2)
+    # Добавляем кнопки для изменения данных (только для обычных пользователей, не суперадмина)
+    if callback.from_user.id != YOUR_ADMIN_ID:
+        kb.add(InlineKeyboardButton("🔄 Изменить наставника", callback_data="change_mentor_btn"))
+        kb.add(InlineKeyboardButton("📊 Изменить уровень", callback_data="change_level_btn"))
     kb.add(InlineKeyboardButton("⬅ Назад в меню", callback_data="back_main"))
     await callback.message.answer(text, reply_markup=kb)
 
@@ -979,26 +1454,37 @@ async def my_students(callback):
     
     today_str = str(date.today())
     
+    is_admin = user_id in [OLGA_ID, YOUR_ADMIN_ID]
+    
+    if not is_admin and str(user_id) not in users:
+        await callback.answer("Вы не зарегистрированы", show_alert=True)
+        return
+    
     if str(user_id) in users:
         users[str(user_id)]["active_today"] = today_str
         save_users(data)
     
+    has_students = any(u.get("mentor") == str(user_id) for u in users.values())
+    
     kb = InlineKeyboardMarkup(row_width=2)
     
     for lvl in LEVELS_ORDER:
-        kb.add(InlineKeyboardButton(lvl, callback_data=f"show_students:{lvl}"))
+        if is_admin or has_students:
+            kb.add(InlineKeyboardButton(lvl, callback_data=f"show_students:{lvl}"))
     
-    # Для админа всегда показываем "Вся ветка", для остальных - только если есть ученики
-    if user_id == YOUR_ADMIN_ID:
+    if is_admin:
         kb.add(InlineKeyboardButton("🌳 Вся моя ветка", callback_data="my_full_branch"))
-    else:
-        has_students = any(u.get("mentor") == str(user_id) for u in users.values())
-        if has_students:
-            kb.add(InlineKeyboardButton("🌳 Вся моя ветка", callback_data="my_full_branch"))
+    elif has_students:
+        kb.add(InlineKeyboardButton("🌳 Вся моя ветка", callback_data="my_full_branch"))
     
     kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_main"))
     
-    await callback.message.answer("Выберите уровень или просмотр ветки:", reply_markup=kb)
+    if is_admin:
+        await callback.message.answer("👑 <b>Администраторская панель учеников</b>\nВыберите уровень или просмотр ветки:", reply_markup=kb)
+    elif has_students:
+        await callback.message.answer("Выберите уровень или просмотр ветки:", reply_markup=kb)
+    else:
+        await callback.message.answer("У вас пока нет учеников.", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data == "back_main")
 async def back_main(callback):
@@ -1032,7 +1518,9 @@ async def show_students(callback):
         users[str(user_id)]["active_today"] = today_str
         save_users(data)
 
-    if user_id == YOUR_ADMIN_ID:
+    is_admin = user_id in [OLGA_ID, YOUR_ADMIN_ID]
+    
+    if is_admin:
         students = [(uid, u) for uid, u in users.items() if u.get("level") == level]
         title = f"👑 Все ученики уровня {level} (админ-просмотр):"
     else:
@@ -1052,7 +1540,7 @@ async def show_students(callback):
         full_name = f"{u['name']} {u.get('surname','')}".strip()
         text += f"{i}. {full_name}"
         
-        if user_id == YOUR_ADMIN_ID and u.get("mentor"):
+        if is_admin and u.get("mentor"):
             mentor = users.get(u["mentor"], {})
             mentor_name = f"{mentor.get('name', '?')} {mentor.get('surname', '')}".strip()
             if mentor_name.strip():
@@ -1070,7 +1558,6 @@ async def show_students(callback):
 async def my_full_branch(callback):
     user_id = str(callback.from_user.id)
     
-    # ЕСЛИ ЭТО АДМИН - ПОКАЗЫВАЕМ ПОЛНУЮ ИЕРАРХИЮ
     if callback.from_user.id == YOUR_ADMIN_ID:
         await full_hierarchy(callback)
         return
@@ -1136,7 +1623,8 @@ async def my_full_branch(callback):
     
     kb.add(InlineKeyboardButton("⬅ Назад", callback_data="show_my_students"))
     
-    await callback.message.answer(text, reply_markup=kb)
+    # Используем безопасную отправку
+    await safe_send_message(callback.from_user.id, text, reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("branch_level:"))
 async def branch_level_detail(callback):
@@ -1198,7 +1686,8 @@ async def branch_level_detail(callback):
     
     kb.add(InlineKeyboardButton("⬅ Назад к ветке", callback_data="my_full_branch"))
     
-    await callback.message.answer(text, reply_markup=kb)
+    # Используем безопасную отправку
+    await safe_send_message(callback.from_user.id, text, reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("student_profile:"))
 async def student_profile(callback):
@@ -1293,12 +1782,8 @@ async def all_users(callback):
     
     text += f"<b>Всего пользователей:</b> {len(users)}"
     
-    if len(text) > 4000:
-        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
-        for part in parts:
-            await callback.message.answer(part)
-    else:
-        await callback.message.answer(text)
+    # Используем безопасную отправку
+    await safe_send_message(callback.from_user.id, text)
 
 # --- ПОЛНАЯ ИЕРАРХИЯ ---
 @dp.callback_query_handler(lambda c: c.data == "full_hierarchy")
@@ -1331,12 +1816,8 @@ async def full_hierarchy(callback):
     for root_id in roots:
         text += build_tree(root_id)
     
-    if len(text) > 4000:
-        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
-        for part in parts:
-            await callback.message.answer(part)
-    else:
-        await callback.message.answer(text)
+    # Используем безопасную отправку
+    await safe_send_message(callback.from_user.id, text)
 
 # --- РАССЫЛКА ---
 @dp.callback_query_handler(lambda c: c.data == "admin_broadcast")
@@ -1439,6 +1920,7 @@ async def cancel_broadcast(callback):
     await callback.message.edit_text("❌ Рассылка отменена.")
     await admin_main_menu(callback.from_user.id)
 
+# --- ОБРАБОТЧИК РАССЫЛКИ С ЗАДАНИЕМ ---
 @dp.message_handler(state=Form.admin_message, content_types=types.ContentTypes.ANY)
 async def admin_send_message(message, state):
     data = await state.get_data()
@@ -1450,6 +1932,16 @@ async def admin_send_message(message, state):
     recipient_names = []
     
     today_str = str(date.today())
+    
+    # Проверяем, является ли отправитель Ольгой или суперадмином
+    is_assignment_admin = message.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]
+    
+    # Проверяем, является ли сообщение заданием (содержит ключевые слова)
+    is_assignment = False
+    if is_assignment_admin and message.content_type == "text":
+        assignment_keywords = ["задание", "упражнение", "задача", "домашнее", "homework", "exercise", "task"]
+        if any(keyword in message.text.lower() for keyword in assignment_keywords):
+            is_assignment = True
     
     for uid, u in users_data.items():
         if broadcast_to_all:
@@ -1464,6 +1956,42 @@ async def admin_send_message(message, state):
             full_name = f"{u['name']} {u.get('surname','')}".strip()
             recipient_names.append(full_name)
     
+    # Если это задание от администратора, предлагаем отправить как задание
+    if is_assignment and is_assignment_admin:
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("✅ Отправить как ЗАДАНИЕ", callback_data="send_as_assignment"),
+            InlineKeyboardButton("📢 Просто рассылка", callback_data="confirm_send")
+        )
+        kb.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_send"))
+        
+        preview_text = f"📚 <b>ОБНАРУЖЕНО ЗАДАНИЕ ОТ АДМИНИСТРАТОРА</b>\n\n"
+        
+        if broadcast_to_all:
+            target = "ВСЕМ ученикам"
+        elif selected_levels:
+            target = f"ученикам уровней: {', '.join(selected_levels)}"
+        else:
+            target = "не выбранным ученикам"
+            
+        preview_text += f"• Кому: {target}\n"
+        preview_text += f"• Получателей-учеников: {len(recipients)}\n"
+        preview_text += f"• Тип: задание\n\n"
+        preview_text += f"<b>Текст задания:</b>\n{message.text[:300]}..."
+        
+        await state.update_data(
+            message_to_send=message,
+            recipients=recipients,
+            recipient_names=recipient_names,
+            selected_levels=selected_levels,
+            broadcast_to_all=broadcast_to_all,
+            is_assignment=True
+        )
+        
+        await message.answer(preview_text, reply_markup=kb)
+        return
+    
+    # Обычная рассылка
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("✅ Отправить", callback_data="confirm_send"),
@@ -1492,11 +2020,652 @@ async def admin_send_message(message, state):
         recipients=recipients,
         recipient_names=recipient_names,
         selected_levels=selected_levels,
-        broadcast_to_all=broadcast_to_all
+        broadcast_to_all=broadcast_to_all,
+        is_assignment=False
     )
     
     await message.answer(preview_text, reply_markup=kb)
 
+# --- ОТПРАВКА КАК ЗАДАНИЕ ---
+@dp.callback_query_handler(lambda c: c.data == "send_as_assignment", state=Form.admin_message)
+async def send_as_assignment(callback: types.CallbackQuery, state):
+    """Администратор отправляет задание ученикам"""
+    data = await state.get_data()
+    message = data.get("message_to_send")
+    selected_levels = data.get("selected_levels", [])
+    broadcast_to_all = data.get("broadcast_to_all", False)
+    
+    await callback.message.edit_text(f"📚 Создаю задание...")
+    
+    # Загружаем данные
+    users_data = load_users()["users"]
+    assignments_data = load_assignments()
+    
+    # Создаем уникальный ID для задания
+    assignment_id = f"assignment_{message.from_user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Получаем имя администратора
+    admin_name = "Ольга" if callback.from_user.id == OLGA_ID else "Суперадмин"
+    
+    # Собираем информацию о задании
+    assignment_info = {
+        "assignment_id": assignment_id,
+        "from_admin": True,
+        "admin_id": str(callback.from_user.id),
+        "admin_name": admin_name,
+        "levels": selected_levels if not broadcast_to_all else ["ALL"],
+        "timestamp": str(datetime.now()),
+        "content_type": message.content_type,
+        "sent_count": 0
+    }
+    
+    if message.content_type == "text":
+        assignment_info["text"] = message.text
+    elif message.content_type == "photo":
+        assignment_info["photo_id"] = message.photo[-1].file_id
+        assignment_info["caption"] = message.caption
+    elif message.content_type == "document":
+        assignment_info["document_id"] = message.document.file_id
+        assignment_info["caption"] = message.caption
+    elif message.content_type == "voice":
+        assignment_info["voice_id"] = message.voice.file_id
+    elif message.content_type == "video":
+        assignment_info["video_id"] = message.video.file_id
+        assignment_info["caption"] = message.caption
+    
+    # Отправляем задание всем ученикам выбранных уровней
+    sent_to_students = []
+    failed_students = []
+    
+    for uid, u in users_data.items():
+        # Проверяем, что пользователь ученик (не админ) и его уровень в выбранных
+        if (broadcast_to_all or u.get("level") in selected_levels) and int(uid) not in [OLGA_ID, YOUR_ADMIN_ID]:
+            
+            try:
+                # Создаем клавиатуру для ученика
+                kb_student = InlineKeyboardMarkup()
+                kb_student.add(
+                    InlineKeyboardButton("📤 Отправить решение наставнику", 
+                                        callback_data=f"send_solution_to_mentor:{assignment_id}")
+                )
+                
+                # Отправляем задание ученику
+                if message.content_type == "text":
+                    await bot.send_message(
+                        uid,
+                        f"📚 <b>НОВОЕ ЗАДАНИЕ ОТ {admin_name.upper()}</b>\n\n"
+                        f"{message.text}\n\n"
+                        f"<i>Нажмите кнопку ниже, чтобы отправить решение вашему наставнику</i>",
+                        reply_markup=kb_student,
+                        parse_mode="HTML"
+                    )
+                elif message.content_type == "photo":
+                    await bot.send_photo(
+                        uid,
+                        message.photo[-1].file_id,
+                        caption=f"📚 <b>НОВОЕ ЗАДАНИЕ ОТ {admin_name.upper()}</b>\n\n"
+                               f"{message.caption or ''}\n\n"
+                               f"<i>Нажмите кнопку ниже, чтобы отправить решение вашему наставнику</i>",
+                        reply_markup=kb_student,
+                        parse_mode="HTML"
+                    )
+                
+                sent_to_students.append({
+                    "student_id": uid,
+                    "student_name": f"{u['name']} {u.get('surname','')}".strip(),
+                    "mentor_id": u.get("mentor"),
+                    "level": u.get("level")
+                })
+                
+                assignment_info["sent_count"] += 1
+                
+            except Exception as e:
+                failed_students.append(f"{u['name']} {u.get('surname','')}")
+                log_error(f"Ошибка отправки задания ученику {uid}: {e}")
+    
+    # Сохраняем задание
+    assignments_data.setdefault("assignments", {})[assignment_id] = assignment_info
+    
+    # Сохраняем информацию о том, кому отправлено
+    assignments_data.setdefault("assignment_recipients", {})[assignment_id] = sent_to_students
+    
+    if save_assignments(assignments_data):
+        # Формируем отчет для администратора
+        report_text = f"✅ <b>Задание успешно отправлено!</b>\n\n"
+        report_text += f"• ID задания: <code>{assignment_id}</code>\n"
+        
+        if broadcast_to_all:
+            report_text += f"• Все ученики\n"
+        else:
+            report_text += f"• Уровни: {', '.join(selected_levels)}\n"
+            
+        report_text += f"• Отправлено ученикам: {len(sent_to_students)}\n"
+        
+        if sent_to_students:
+            report_text += f"\n<b>Получили задание:</b>\n"
+            for i, student in enumerate(sent_to_students[:20], 1):  # Показываем первые 20
+                mentor_info = ""
+                if student["mentor_id"] and student["mentor_id"] in users_data:
+                    mentor = users_data[student["mentor_id"]]
+                    mentor_info = f" → {mentor['name']}"
+                report_text += f"{i}. {student['student_name']}{mentor_info}\n"
+            
+            if len(sent_to_students) > 20:
+                report_text += f"... и еще {len(sent_to_students) - 20} учеников\n"
+        
+        if failed_students:
+            report_text += f"\n❌ <b>Не отправлено ({len(failed_students)}):</b>\n"
+            report_text += ", ".join(failed_students[:10])
+            if len(failed_students) > 10:
+                report_text += f"... и еще {len(failed_students) - 10}"
+        
+        # Кнопки для администратора
+        kb_admin = InlineKeyboardMarkup()
+        kb_admin.add(
+            InlineKeyboardButton("📊 Статус выполнения", callback_data=f"check_assignment:{assignment_id}"),
+            InlineKeyboardButton("📝 Новое задание", callback_data="admin_broadcast")
+        )
+        
+        await callback.message.edit_text(report_text, reply_markup=kb_admin, parse_mode="HTML")
+    else:
+        await callback.message.edit_text("❌ Ошибка сохранения задания")
+    
+    await state.finish()
+
+# --- ПРОСМОТР РЕШЕНИЙ УЧЕНИКОВ ---
+@dp.callback_query_handler(lambda c: c.data == "view_student_solutions")
+async def view_student_solutions(callback: types.CallbackQuery):
+    """Наставник просматривает решения от своих учеников"""
+    mentor_id = str(callback.from_user.id)
+    
+    assignments_data = load_assignments()
+    solutions = assignments_data.get("solutions", {})
+    
+    # Фильтруем решения, предназначенные этому наставнику
+    mentor_solutions = []
+    for solution_id, solution in solutions.items():
+        if solution.get("mentor_id") == mentor_id:
+            mentor_solutions.append(solution)
+    
+    if not mentor_solutions:
+        await callback.message.answer(
+            "📭 <b>У вас пока нет решений от учеников</b>\n\n"
+            "Когда ваши ученики отправят решения заданий от администраторов, "
+            "они появятся здесь.",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Сортируем по времени (новые сначала)
+    mentor_solutions.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    
+    text = f"📥 <b>Решения от ваших учеников</b>\n\n"
+    text += f"Всего решений: {len(mentor_solutions)}\n\n"
+    
+    # Показываем последние 5 решений
+    for i, solution in enumerate(mentor_solutions[:5], 1):
+        timestamp = solution.get("timestamp", "")
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                time_str = dt.strftime("%d.%m %H:%M")
+            except:
+                time_str = timestamp
+        else:
+            time_str = "?"
+        
+        student_name = solution.get("student_name", "Ученик")
+        preview = ""
+        
+        if solution.get("text"):
+            preview = solution["text"][:50] + "..." if len(solution["text"]) > 50 else solution["text"]
+        elif solution.get("caption"):
+            preview = solution["caption"][:50] + "..." if len(solution["caption"]) > 50 else solution["caption"]
+        
+        text += f"{i}. <b>{student_name}</b> ({time_str})\n"
+        if preview:
+            text += f"   {preview}\n"
+        text += "\n"
+    
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="view_student_solutions"))
+    
+    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+# --- УЧЕНИК ОТПРАВЛЯЕТ РЕШЕНИЕ НАСТАВНИКУ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("send_solution_to_mentor:"))
+async def send_solution_to_mentor(callback: types.CallbackQuery):
+    """Ученик хочет отправить решение своему наставнику"""
+    assignment_id = callback.data.split(":")[1]
+    student_id = str(callback.from_user.id)
+    
+    # Загружаем данные
+    assignments_data = load_assignments()
+    users_data = load_users()["users"]
+    
+    # Проверяем задание
+    assignment = assignments_data.get("assignments", {}).get(assignment_id)
+    if not assignment:
+        await callback.answer("Задание не найдено", show_alert=True)
+        return
+    
+    # Проверяем, что ученик есть в базе
+    if student_id not in users_data:
+        await callback.answer("Вы не зарегистрированы", show_alert=True)
+        return
+    
+    student = users_data[student_id]
+    
+    # Проверяем, есть ли у ученика наставник
+    mentor_id = student.get("mentor")
+    if not mentor_id:
+        await callback.answer("У вас нет наставника для отправки решения", show_alert=True)
+        return
+    
+    # Проверяем, что наставник существует
+    if mentor_id not in users_data:
+        await callback.answer("Ваш наставник не найден в системе", show_alert=True)
+        return
+    
+    # Сохраняем данные в состоянии
+    state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
+    await state.update_data(
+        assignment_id=assignment_id,
+        mentor_id=mentor_id,
+        student_id=student_id
+    )
+    
+    await callback.message.answer(
+        "📤 <b>Отправка решения наставнику</b>\n\n"
+        "Отправьте ваше решение задания.\n\n"
+        "Вы можете отправить:\n"
+        "• Текст с ответом\n"
+        "• Фотографию/скриншот решения\n"
+        "• Документ (PDF, Word)\n"
+        "• Голосовое объяснение\n\n"
+        "<i>Ваше решение будет отправлено вашему личному наставнику</i>"
+    )
+    
+    await AssignmentStates.waiting_for_solution.set()
+
+# --- ПОЛУЧЕНИЕ РЕШЕНИЯ ОТ УЧЕНИКА ---
+@dp.message_handler(state=AssignmentStates.waiting_for_solution, content_types=types.ContentTypes.ANY)
+async def receive_solution_from_student(message: types.Message, state):
+    """Получение решения от ученика и отправка его наставнику"""
+    student_id = str(message.from_user.id)
+    data = await state.get_data()
+    
+    assignment_id = data.get("assignment_id")
+    mentor_id = data.get("mentor_id")
+    
+    if not assignment_id or not mentor_id:
+        await message.answer("❌ Ошибка: данные не найдены")
+        await state.finish()
+        return
+    
+    # Загружаем данные
+    users_data = load_users()["users"]
+    assignments_data = load_assignments()
+    
+    # Получаем информацию о пользователях
+    student = users_data.get(student_id)
+    mentor = users_data.get(mentor_id)
+    assignment = assignments_data.get("assignments", {}).get(assignment_id)
+    
+    if not student or not mentor or not assignment:
+        await message.answer("❌ Ошибка: данные не найдены")
+        await state.finish()
+        return
+    
+    student_name = f"{student['name']} {student.get('surname','')}".strip()
+    mentor_name = f"{mentor['name']} {mentor.get('surname','')}".strip()
+    admin_name = assignment.get("admin_name", "Администратора")
+    
+    # Создаем ID для решения
+    solution_id = f"solution_{student_id}_{assignment_id}_{datetime.now().strftime('%H%M%S')}"
+    
+    # Сохраняем решение
+    solution_info = {
+        "solution_id": solution_id,
+        "assignment_id": assignment_id,
+        "student_id": student_id,
+        "student_name": student_name,
+        "mentor_id": mentor_id,
+        "mentor_name": mentor_name,
+        "timestamp": str(datetime.now()),
+        "content_type": message.content_type,
+        "from_admin_assignment": True,
+        "admin_name": admin_name
+    }
+    
+    # Сохраняем в зависимости от типа контента
+    if message.content_type == "text":
+        solution_info["text"] = message.text
+    elif message.content_type == "photo":
+        solution_info["photo_id"] = message.photo[-1].file_id
+        solution_info["caption"] = message.caption
+    elif message.content_type == "document":
+        solution_info["document_id"] = message.document.file_id
+        solution_info["caption"] = message.caption
+    elif message.content_type == "voice":
+        solution_info["voice_id"] = message.voice.file_id
+    
+    # Получаем текст задания для наставника
+    assignment_text = assignment.get("text") or assignment.get("caption") or f"Задание от {admin_name}"
+    if len(assignment_text) > 200:
+        assignment_text = assignment_text[:200] + "..."
+    
+    # Сохраняем решение
+    assignments_data.setdefault("solutions", {})[solution_id] = solution_info
+    
+    if save_assignments(assignments_data):
+        try:
+            # Отправляем решение наставнику
+            kb_mentor = InlineKeyboardMarkup(row_width=2)
+            kb_mentor.add(
+                InlineKeyboardButton("💬 Ответить ученику", 
+                                   callback_data=f"reply_to_student:{student_id}:{assignment_id}"),
+                InlineKeyboardButton("👀 Просмотреть задание", 
+                                   callback_data=f"view_assignment:{assignment_id}")
+            )
+            
+            if message.content_type == "text":
+                await bot.send_message(
+                    mentor_id,
+                    f"📤 <b>РЕШЕНИЕ ОТ ВАШЕГО УЧЕНИКА</b>\n\n"
+                    f"👤 <b>Ученик:</b> {student_name}\n"
+                    f"📚 <b>Задание от {admin_name}:</b>\n{assignment_text}\n\n"
+                    f"<b>Решение ученика:</b>\n{message.text}\n\n"
+                    f"<i>Вы можете ответить ученику или просмотреть полное задание</i>",
+                    reply_markup=kb_mentor,
+                    parse_mode="HTML"
+                )
+            elif message.content_type == "photo":
+                await bot.send_photo(
+                    mentor_id,
+                    message.photo[-1].file_id,
+                    caption=f"📤 <b>РЕШЕНИЕ ОТ ВАШЕГО УЧЕНИКА</b>\n\n"
+                           f"👤 <b>Ученик:</b> {student_name}\n"
+                           f"📚 <b>Задание от {admin_name}:</b>\n{assignment_text}\n\n"
+                           f"<b>Решение ученика:</b>\n{message.caption or 'Фото решения'}\n\n"
+                           f"<i>Вы можете ответить ученику или просмотреть полное задание</i>",
+                    reply_markup=kb_mentor,
+                    parse_mode="HTML"
+                )
+            
+            # Уведомляем ученика
+            await message.answer(
+                f"✅ Ваше решение отправлено наставнику <b>{mentor_name}</b>!\n\n"
+                f"Ожидайте обратной связи. Наставник может ответить вам здесь."
+            )
+            
+            # Обновляем статистику задания
+            if assignment_id in assignments_data.get("assignments", {}):
+                if "solutions_count" not in assignments_data["assignments"][assignment_id]:
+                    assignments_data["assignments"][assignment_id]["solutions_count"] = 0
+                assignments_data["assignments"][assignment_id]["solutions_count"] += 1
+                
+                # Сохраняем, кто отправил решение
+                if "solutions_sent" not in assignments_data["assignments"][assignment_id]:
+                    assignments_data["assignments"][assignment_id]["solutions_sent"] = []
+                assignments_data["assignments"][assignment_id]["solutions_sent"].append({
+                    "student_id": student_id,
+                    "student_name": student_name,
+                    "mentor_id": mentor_id,
+                    "timestamp": str(datetime.now())
+                })
+                
+                save_assignments(assignments_data)
+                
+        except Exception as e:
+            log_error(f"Ошибка отправки решения наставнику: {e}")
+            await message.answer(f"❌ Ошибка отправки решения: {e}")
+    else:
+        await message.answer("❌ Ошибка сохранения решения")
+    
+    await state.finish()
+
+# --- НАСТАВНИК ОТВЕЧАЕТ УЧЕНИКУ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("reply_to_student:"))
+async def reply_to_student_handler(callback: types.CallbackQuery):
+    """Наставник отвечает ученику на решение"""
+    parts = callback.data.split(":")
+    student_id = parts[1]
+    assignment_id = parts[2] if len(parts) > 2 else None
+    
+    # Сохраняем данные в состоянии
+    state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
+    await state.update_data(
+        reply_to_student=student_id,
+        reply_assignment_id=assignment_id
+    )
+    
+    await callback.message.answer(
+        "💬 <b>Ответ ученику</b>\n\n"
+        "Отправьте ваше сообщение ученику.\n"
+        "Это может быть:\n"
+        "• Обратная связь по решению\n"
+        "• Исправления\n"
+        "• Похвала\n"
+        "• Вопросы по решению\n\n"
+        "<i>Сообщение будет отправлено ученику и сохранено в истории</i>"
+    )
+    
+    await AssignmentStates.mentor_reply.set()
+
+# --- ПОЛУЧЕНИЕ ОТВЕТА ОТ НАСТАВНИКА ---
+@dp.message_handler(state=AssignmentStates.mentor_reply, content_types=types.ContentTypes.ANY)
+async def receive_mentor_reply(message: types.Message, state):
+    """Получение ответа от наставника и отправка ученику"""
+    mentor_id = str(message.from_user.id)
+    data = await state.get_data()
+    
+    student_id = data.get("reply_to_student")
+    assignment_id = data.get("reply_assignment_id")
+    
+    if not student_id:
+        await message.answer("❌ Ошибка: ученик не указан")
+        await state.finish()
+        return
+    
+    # Загружаем данные
+    users_data = load_users()["users"]
+    
+    # Проверяем, что наставник действительно наставник этого ученика
+    student = users_data.get(student_id)
+    if not student or student.get("mentor") != mentor_id:
+        await message.answer("❌ Ошибка: вы не являетесь наставником этого ученика")
+        await state.finish()
+        return
+    
+    mentor = users_data.get(mentor_id)
+    student_name = f"{student['name']} {student.get('surname','')}".strip()
+    mentor_name = f"{mentor['name']} {mentor.get('surname','')}".strip()
+    
+    # Сохраняем ответ в истории
+    assignments_data = load_assignments()
+    
+    reply_id = f"reply_{mentor_id}_{student_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    reply_info = {
+        "reply_id": reply_id,
+        "assignment_id": assignment_id,
+        "from_mentor": True,
+        "mentor_id": mentor_id,
+        "mentor_name": mentor_name,
+        "student_id": student_id,
+        "student_name": student_name,
+        "timestamp": str(datetime.now()),
+        "content_type": message.content_type
+    }
+    
+    if message.content_type == "text":
+        reply_info["text"] = message.text
+    elif message.content_type == "photo":
+        reply_info["photo_id"] = message.photo[-1].file_id
+        reply_info["caption"] = message.caption
+    
+    # Сохраняем в истории переписки
+    assignments_data.setdefault("conversations", {})[reply_id] = reply_info
+    
+    if save_assignments(assignments_data):
+        try:
+            # Отправляем ответ ученику
+            if message.content_type == "text":
+                await bot.send_message(
+                    student_id,
+                    f"💬 <b>ОТВЕТ ОТ ВАШЕГО НАСТАВНИКА</b>\n\n"
+                    f"👤 <b>Наставник:</b> {mentor_name}\n\n"
+                    f"{message.text}\n\n"
+                    f"<i>Вы можете продолжить диалог, просто отправляя сообщения сюда</i>"
+                )
+            elif message.content_type == "photo":
+                await bot.send_photo(
+                    student_id,
+                    message.photo[-1].file_id,
+                    caption=f"💬 <b>ОТВЕТ ОТ ВАШЕГО НАСТАВНИКА</b>\n\n"
+                           f"👤 <b>Наставник:</b> {mentor_name}\n\n"
+                           f"{message.caption or ''}\n\n"
+                           f"<i>Вы можете продолжить диалог, просто отправляя сообщения сюда</i>"
+                )
+            
+            # Уведомляем наставника
+            await message.answer(f"✅ Ответ отправлен ученику <b>{student_name}</b>")
+            
+            # Сохраняем состояние для продолжения диалога
+            state = dp.current_state(user=mentor_id, chat=mentor_id)
+            await state.update_data(
+                in_conversation_with=student_id,
+                conversation_assignment=assignment_id
+            )
+            
+        except Exception as e:
+            log_error(f"Ошибка отправки ответа ученику: {e}")
+            await message.answer(f"❌ Ошибка отправки ответа: {e}")
+    else:
+        await message.answer("❌ Ошибка сохранения ответа")
+    
+    await state.finish()
+
+# --- ПРОСМОТР ЗАДАНИЯ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("view_assignment:"))
+async def view_assignment_handler(callback: types.CallbackQuery):
+    """Наставник просматривает задание от администратора"""
+    assignment_id = callback.data.split(":")[1]
+    
+    assignments_data = load_assignments()
+    assignment = assignments_data.get("assignments", {}).get(assignment_id)
+    
+    if not assignment:
+        await callback.answer("Задание не найдено", show_alert=True)
+        return
+    
+    admin_name = assignment.get("admin_name", "Администратора")
+    levels = assignment.get("levels", [])
+    
+    text = f"📚 <b>ЗАДАНИЕ ОТ {admin_name.upper()}</b>\n\n"
+    text += f"• ID: <code>{assignment_id}</code>\n"
+    text += f"• Уровни: {', '.join(levels) if levels else 'Все ученики'}\n"
+    text += f"• Время: {assignment.get('timestamp', '?')}\n"
+    text += f"• Отправлено ученикам: {assignment.get('sent_count', 0)}\n"
+    text += f"• Решений получено: {assignment.get('solutions_count', 0)}\n\n"
+    
+    if assignment.get("text"):
+        text += f"<b>Текст задания:</b>\n{assignment['text']}\n"
+    elif assignment.get("caption"):
+        text += f"<b>Задание:</b>\n{assignment['caption']}\n"
+    
+    # Показываем, какие ученики отправили решения
+    solutions_sent = assignment.get("solutions_sent", [])
+    if solutions_sent:
+        text += f"\n<b>Решения от ваших учеников:</b>\n"
+        
+        # Фильтруем только учеников этого наставника
+        mentor_students = [s for s in solutions_sent if s.get("mentor_id") == str(callback.from_user.id)]
+        
+        if mentor_students:
+            for i, solution in enumerate(mentor_students, 1):
+                text += f"{i}. {solution.get('student_name', '?')} - {solution.get('timestamp', '?')}\n"
+        else:
+            text += "Ваши ученики еще не отправляли решения\n"
+    
+    await callback.message.answer(text, parse_mode="HTML")
+
+# --- ПРОВЕРКА СТАТУСА ЗАДАНИЯ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("check_assignment:"))
+async def check_assignment_status(callback: types.CallbackQuery):
+    """Администратор проверяет статус выполнения задания"""
+    assignment_id = callback.data.split(":")[1]
+    
+    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
+        await callback.answer("Только для администраторов", show_alert=True)
+        return
+    
+    assignments_data = load_assignments()
+    users_data = load_users()["users"]
+    
+    assignment = assignments_data.get("assignments", {}).get(assignment_id)
+    if not assignment:
+        await callback.answer("Задание не найдено", show_alert=True)
+        return
+    
+    # Получаем всех получателей
+    recipients = assignments_data.get("assignment_recipients", {}).get(assignment_id, [])
+    
+    admin_name = assignment.get("admin_name", "Администратора")
+    
+    text = f"📊 <b>СТАТУС ВЫПОЛНЕНИЯ ЗАДАНИЯ ОТ {admin_name.upper()}</b>\n\n"
+    text += f"• ID: <code>{assignment_id}</code>\n"
+    
+    levels = assignment.get("levels", [])
+    if levels == ["ALL"]:
+        text += f"• Все ученики\n"
+    else:
+        text += f"• Уровни: {', '.join(levels)}\n"
+        
+    text += f"• Всего учеников: {len(recipients)}\n"
+    text += f"• Отправили решения: {assignment.get('solutions_count', 0)}\n\n"
+    
+    # Группируем по наставникам
+    mentors_summary = {}
+    
+    for recipient in recipients:
+        mentor_id = recipient.get("mentor_id")
+        if mentor_id:
+            if mentor_id not in mentors_summary:
+                mentor_name = ""
+                if mentor_id in users_data:
+                    mentor = users_data[mentor_id]
+                    mentor_name = f"{mentor['name']} {mentor.get('surname','')}".strip()
+                mentors_summary[mentor_id] = {
+                    "name": mentor_name,
+                    "students": [],
+                    "solutions": 0
+                }
+            mentors_summary[mentor_id]["students"].append(recipient["student_name"])
+    
+    # Считаем решения по наставникам
+    solutions_sent = assignment.get("solutions_sent", [])
+    for solution in solutions_sent:
+        mentor_id = solution.get("mentor_id")
+        if mentor_id in mentors_summary:
+            mentors_summary[mentor_id]["solutions"] += 1
+    
+    text += "<b>По наставникам:</b>\n"
+    for mentor_id, info in list(mentors_summary.items())[:15]:  # Ограничиваем вывод
+        text += f"\n👤 <b>{info['name'] or 'Без наставника'}</b>\n"
+        text += f"   Учеников: {len(info['students'])}\n"
+        text += f"   Решений: {info['solutions']}\n"
+        if info['solutions'] < len(info['students']):
+            missing = len(info['students']) - info['solutions']
+            text += f"   ❌ Ждут: {missing} учеников\n"
+    
+    if len(mentors_summary) > 15:
+        text += f"\n... и еще {len(mentors_summary) - 15} наставников"
+    
+    await callback.message.answer(text, parse_mode="HTML")
+
+# --- ОБЫЧНАЯ РАССЫЛКА ---
 @dp.callback_query_handler(lambda c: c.data == "confirm_send", state=Form.admin_message)
 async def confirm_send(callback, state):
     data = await state.get_data()
@@ -1603,6 +2772,16 @@ if __name__ == "__main__":
     if corrupted_files:
         print(f"⚠️ Найдено поврежденных файлов: {len(corrupted_files)}")
     
+    # Проверяем файл заданий
+    if os.path.exists(ASSIGNMENTS_FILE):
+        assignments_data = load_assignments()
+        assignments_count = len(assignments_data.get('assignments', {}))
+        solutions_count = len(assignments_data.get('solutions', {}))
+        print(f"📚 Загружено заданий: {assignments_count}")
+        print(f"📝 Загружено решений: {solutions_count}")
+    else:
+        print(f"📚 Файл заданий создан")
+    
     loop = asyncio.get_event_loop()
     loop.run_until_complete(set_bot_commands())
     print("✅ Меню команд настроено")
@@ -1614,6 +2793,9 @@ if __name__ == "__main__":
     print("🚀 Бот запущен и готов к работе!")
     print("🛡️  Данные защищены от потери")
     print("🔧 Новые команды для админа: /check_data, /fix_data")
+    print("📊 Добавлены функции смены наставника и уровня")
+    print("📚 Добавлена система заданий: Ольга/Суперадмин → ученики → наставники")
+    print("🔄 Защита от длинных сообщений добавлена")
     print("="*50)
     
     executor.start_polling(dp, skip_updates=True)
