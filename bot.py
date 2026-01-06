@@ -624,9 +624,9 @@ async def students_command(message: types.Message, state=None):
     for lvl in LEVELS_ORDER:
         kb.add(InlineKeyboardButton(lvl, callback_data=f"show_students:{lvl}"))
     
-    if user_id != YOUR_ADMIN_ID:
-        if has_students:
-            kb.add(InlineKeyboardButton("🌳 Вся моя ветка", callback_data="my_full_branch"))
+    # Для админа всегда показываем "Вся ветка", для остальных - только если есть ученики
+    if user_id == YOUR_ADMIN_ID or (user_id != YOUR_ADMIN_ID and has_students):
+        kb.add(InlineKeyboardButton("🌳 Вся моя ветка", callback_data="my_full_branch"))
     
     kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_main"))
     
@@ -968,7 +968,7 @@ async def show_my_profile(callback):
     
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("⬅ Назад в меню", callback_data="back_main"))
-    await callback.message.answer(text, reply_mup=kb)
+    await callback.message.answer(text, reply_markup=kb)
 
 # --- Меню "Мои ученики" ---
 @dp.callback_query_handler(lambda c: c.data == "show_my_students")
@@ -988,7 +988,10 @@ async def my_students(callback):
     for lvl in LEVELS_ORDER:
         kb.add(InlineKeyboardButton(lvl, callback_data=f"show_students:{lvl}"))
     
-    if user_id != YOUR_ADMIN_ID:
+    # Для админа всегда показываем "Вся ветка", для остальных - только если есть ученики
+    if user_id == YOUR_ADMIN_ID:
+        kb.add(InlineKeyboardButton("🌳 Вся моя ветка", callback_data="my_full_branch"))
+    else:
         has_students = any(u.get("mentor") == str(user_id) for u in users.values())
         if has_students:
             kb.add(InlineKeyboardButton("🌳 Вся моя ветка", callback_data="my_full_branch"))
@@ -1066,6 +1069,11 @@ async def show_students(callback):
 @dp.callback_query_handler(lambda c: c.data == "my_full_branch")
 async def my_full_branch(callback):
     user_id = str(callback.from_user.id)
+    
+    # ЕСЛИ ЭТО АДМИН - ПОКАЗЫВАЕМ ПОЛНУЮ ИЕРАРХИЮ
+    if callback.from_user.id == YOUR_ADMIN_ID:
+        await full_hierarchy(callback)
+        return
     
     data = load_users()
     users = data["users"]
