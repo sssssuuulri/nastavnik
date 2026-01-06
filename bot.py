@@ -11,6 +11,7 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from datetime import datetime, date
 import shutil
+import hashlib
 
 # --- ЛОГИ ---
 logger = logging.getLogger("bot_logger")
@@ -43,9 +44,33 @@ OLGA_ID = 64434196
 YOUR_ADMIN_ID = 911511438
 REPORT_GROUP_ID = "-1003632130674"
 
-# --- БЕЗОПАСНАЯ ЗАГРУЗКА И СОХРАНЕНИЕ ---
+# --- УЛУЧШЕННАЯ БЕЗОПАСНАЯ ЗАГРУЗКА И СОХРАНЕНИЕ ---
+def recover_corrupted_file():
+    """Восстановление поврежденного файла из backup"""
+    backups = [f for f in os.listdir('.') 
+              if f.startswith('users_backup_') and f.endswith('.json')]
+    
+    if backups:
+        backups.sort(reverse=True)  # Сортируем по времени (новые сначала)
+        latest_backup = backups[0]
+        
+        try:
+            shutil.copy2(latest_backup, USERS_FILE)
+            log_info(f"🔄 Восстановлено из backup: {latest_backup}")
+            
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            return data
+        except Exception as e:
+            log_error(f"❌ Не удалось восстановить из backup: {e}")
+    
+    # Создаем новый файл
+    log_info("Создаю новый файл users.json")
+    return {"users": {}}
+
 def load_users():
-    """Загрузка пользователей с защитой от потерь"""
+    """Загрузка пользователей с автоматическим исправлением проблем"""
     if not os.path.exists(USERS_FILE):
         log_info("Файл users.json не найден, создается новый")
         return {"users": {}}
@@ -65,7 +90,50 @@ def load_users():
             log_error("Некорректная структура users.json: отсутствует ключ 'users'")
             return {"users": {}}
         
-        user_count = len(data.get("users", {}))
+        # Исправляем данные при загрузке
+        users = data["users"]
+        fixed_count = 0
+        duplicates_removed = 0
+        
+        for user_id in list(users.keys()):
+            user = users[user_id]
+            
+            # Проверяем что это словарь
+            if not isinstance(user, dict):
+                log_error(f"❌ Некорректный формат пользователя {user_id}, удаляю")
+                del users[user_id]
+                continue
+                
+            # Проверяем обязательные поля
+            if not user.get("name"):
+                log_error(f"❌ Пользователь {user_id} без имени, удаляю")
+                del users[user_id]
+                continue
+            
+            # Исправляем chat_id если не совпадает
+            chat_id_in_data = user.get("chat_id")
+            if chat_id_in_data and chat_id_in_data != user_id:
+                # Проверяем, есть ли уже пользователь с таким chat_id
+                if chat_id_in_data in users:
+                    # Уже есть пользователь с таким chat_id, удаляем дубликат
+                    log_info(f"Удаляю дубликат: {user_id} (совпадает с {chat_id_in_data})")
+                    del users[user_id]
+                    duplicates_removed += 1
+                else:
+                    # Исправляем chat_id
+                    user["chat_id"] = user_id
+                    fixed_count += 1
+            elif not chat_id_in_data:
+                # Добавляем отсутствующий chat_id
+                user["chat_id"] = user_id
+                fixed_count += 1
+        
+        if fixed_count > 0:
+            log_info(f"Исправлено {fixed_count} chat_id")
+        if duplicates_removed > 0:
+            log_info(f"Удалено {duplicates_removed} дубликатов")
+        
+        user_count = len(users)
         log_info(f"✅ Загружено пользователей: {user_count}")
         return data
         
@@ -80,54 +148,70 @@ def load_users():
         except:
             pass
             
-        return {"users": {}}
+        # Пытаемся восстановить из backup
+        return recover_corrupted_file()
         
     except Exception as e:
         log_error(f"❌ Ошибка загрузки users.json: {e}")
         return {"users": {}}
 
 def save_users(data):
-    """Сохранение пользователей БЕЗ потерь данных"""
+    """Сохранение пользователей с атомарной операцией"""
     if "users" not in data:
         log_error("❌ Попытка сохранить данные без ключа 'users'")
         return False
     
-    # Всегда создаем backup перед сохранением
-    try:
-        if os.path.exists(USERS_FILE):
+    user_count = len(data["users"])
+    log_info(f"🔄 Сохранение {user_count} пользователей...")
+    
+    # Backup текущего файла
+    backup_name = None
+    if os.path.exists(USERS_FILE):
+        try:
             backup_name = f"users_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             shutil.copy2(USERS_FILE, backup_name)
             log_info(f"📂 Создан backup: {backup_name}")
-    except Exception as e:
-        log_error(f"⚠️ Не удалось создать backup: {e}")
+        except Exception as e:
+            log_error(f"⚠️ Не удалось создать backup: {e}")
     
-    # Сохраняем во временный файл сначала
+    # Сохраняем во временный файл
     temp_file = f"{USERS_FILE}.tmp"
     try:
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         
-        # Проверяем что временный файл валидный
+        # Проверяем что сохранили корректно
+        with open(temp_file, "rb") as f:
+            temp_hash = hashlib.md5(f.read()).hexdigest()
+        
+        # Проверяем что можем загрузить обратно
         with open(temp_file, "r", encoding="utf-8") as f:
             temp_data = json.load(f)
         
-        # Проверяем структуру
         if "users" not in temp_data:
-            log_error("❌ Временный файл не содержит ключ 'users'")
-            os.remove(temp_file)
-            return False
+            raise ValueError("Временный файл не содержит ключ 'users'")
         
-        # Только теперь заменяем основной файл
-        shutil.move(temp_file, USERS_FILE)
+        # Атомарная замена
+        if os.name == 'nt':  # Windows
+            os.replace(temp_file, USERS_FILE)
+        else:  # Unix/Linux
+            os.rename(temp_file, USERS_FILE)
         
-        user_count = len(data["users"])
-        log_info(f"💾 Сохранено пользователей: {user_count}")
+        log_info(f"✅ Сохранено {user_count} пользователей")
         return True
         
     except Exception as e:
         log_error(f"❌ Ошибка сохранения: {e}")
         
-        # Удаляем временный файл если он есть
+        # Восстанавливаем из backup если есть
+        if backup_name and os.path.exists(backup_name):
+            try:
+                shutil.copy2(backup_name, USERS_FILE)
+                log_info(f"🔄 Восстановлено из backup: {backup_name}")
+            except Exception as restore_error:
+                log_error(f"❌ Не удалось восстановить из backup: {restore_error}")
+        
+        # Удаляем временный файл
         if os.path.exists(temp_file):
             try:
                 os.remove(temp_file)
@@ -149,7 +233,9 @@ async def set_bot_commands():
     admin_commands = commands + [
         types.BotCommand("admin", "👑 Админ-панель"),
         types.BotCommand("stats", "📊 Статистика"),
-        types.BotCommand("broadcast", "📢 Рассылка")
+        types.BotCommand("broadcast", "📢 Рассылка"),
+        types.BotCommand("check_data", "🔧 Проверить данные"),
+        types.BotCommand("fix_data", "🛠 Исправить данные")
     ]
     
     await bot.set_my_commands(commands)
@@ -329,6 +415,70 @@ async def admin_search(callback):
     await callback.message.answer("🔍 <b>Поиск пользователя</b>\n\nВведите имя, фамилию или ID пользователя:")
     await callback.answer("Функция в разработке", show_alert=True)
 
+# --- НОВЫЕ КОМАНДЫ ДЛЯ АДМИНА ---
+@dp.message_handler(commands=["check_data"], state="*")
+async def check_data_command(message: types.Message, state=None):
+    """Проверка целостности данных"""
+    if message.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
+        await message.answer("⚠️ Команда только для администраторов")
+        return
+    
+    data = load_users()
+    users = data["users"]
+    
+    issues = []
+    
+    # Проверяем каждого пользователя
+    for user_id, user in users.items():
+        # 1. Проверка chat_id
+        if user.get("chat_id") != user_id:
+            issues.append(f"❌ {user.get('name')}: chat_id не совпадает (ключ: {user_id}, значение: {user.get('chat_id')})")
+        
+        # 2. Проверка обязательных полей
+        if not user.get("name"):
+            issues.append(f"❌ ID {user_id}: нет имени")
+        
+        # 3. Проверка наставников
+        mentor_id = user.get("mentor")
+        if mentor_id and mentor_id not in users:
+            issues.append(f"⚠️ {user.get('name')}: наставник {mentor_id} не существует")
+        
+        # 4. Проверка на дублирование
+        for other_id, other_user in users.items():
+            if user_id != other_id and user.get("chat_id") == other_user.get("chat_id"):
+                issues.append(f"🚫 Дубликат: {user.get('name')} (ID: {user_id}) и {other_user.get('name')} (ID: {other_id}) имеют одинаковый chat_id")
+                break
+    
+    if not issues:
+        await message.answer(f"✅ Всего пользователей: {len(users)}\n✅ Данные в порядке")
+    else:
+        text = f"🔍 Найдено проблем: {len(issues)}\n\n"
+        text += "\n".join(issues[:20])  # Показываем первые 20 проблем
+        if len(issues) > 20:
+            text += f"\n... и еще {len(issues)-20} проблем"
+        
+        await message.answer(text)
+
+@dp.message_handler(commands=["fix_data"], state="*")
+async def fix_data_command(message: types.Message, state=None):
+    """Автоматическое исправление данных"""
+    if message.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
+        await message.answer("⚠️ Команда только для администраторов")
+        return
+    
+    await message.answer("🔄 Начинаю проверку и исправление данных...")
+    
+    data = load_users()
+    users = data["users"]
+    original_count = len(users)
+    
+    # Просто загружаем и сохраняем - в load_users уже есть исправления
+    if save_users(data):
+        new_count = len(data["users"])
+        await message.answer(f"✅ Данные исправлены\n\n• Было: {original_count}\n• Стало: {new_count}")
+    else:
+        await message.answer("❌ Не удалось исправить данные")
+
 # --- BUTTON: ОБЫЧНОЕ МЕНЮ НАСТАВНИКА ---
 async def mentor_main_menu(user_id):
     if user_id in [OLGA_ID, YOUR_ADMIN_ID]:
@@ -370,8 +520,9 @@ async def help_command(message: types.Message, state=None):
 • Подтверждать заявки новых учеников
 
 <b>Для администраторов:</b>
-• Доступны дополнительные команды (/admin, /stats, /broadcast)
+• Доступны дополнительные команды (/admin, /stats, /broadcast, /check_data, /fix_data)
 • Управление статистикой и рассылками
+• Проверка и исправление данных
     """
     await message.answer(help_text)
 
@@ -681,6 +832,7 @@ async def back_to_mentor_level(callback, state):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("mentor:"), state=Form.choose_mentor)
 async def choose_mentor(callback, state):
+    """ИСПРАВЛЕННАЯ версия: не перезаписывает существующих пользователей"""
     mentor_id = callback.data.split(":")[1]
     await state.update_data(mentor=mentor_id)
 
@@ -690,17 +842,35 @@ async def choose_mentor(callback, state):
     data = load_users()
     users = data["users"]
 
-    # ДОБАВЛЯЕМ нового пользователя к существующим
-    users[user_id] = {
-        "name": data_user["name"],
-        "surname": data_user.get("surname", ""),
-        "level": data_user["level"],
-        "pending_mentor": mentor_id,
-        "chat_id": user_id,
-        "registration_date": str(date.today())
-    }
+    # ПРОВЕРЯЕМ, существует ли уже пользователь
+    if user_id in users:
+        # Обновляем только нужные поля, сохраняем существующие данные
+        existing_user = users[user_id]
+        users[user_id] = {
+            "name": data_user["name"],
+            "surname": data_user.get("surname", existing_user.get("surname", "")),
+            "level": data_user["level"],
+            "pending_mentor": mentor_id,
+            "chat_id": user_id,
+            # Сохраняем существующие поля
+            "registration_date": existing_user.get("registration_date", str(date.today())),
+            "active_today": existing_user.get("active_today"),
+            "mentor": existing_user.get("mentor")  # Сохраняем старого наставника если есть
+        }
+        log_info(f"🔄 Обновлен существующий пользователь: {data_user['name']} (ID: {user_id})")
+    else:
+        # Создаем нового пользователя
+        users[user_id] = {
+            "name": data_user["name"],
+            "surname": data_user.get("surname", ""),
+            "level": data_user["level"],
+            "pending_mentor": mentor_id,
+            "chat_id": user_id,
+            "registration_date": str(date.today())
+        }
+        log_info(f"🆕 Создан новый пользователь: {data_user['name']} (ID: {user_id})")
     
-    # СОХРАНЯЕМ ВСЕХ пользователей (старых + нового)
+    # СОХРАНЯЕМ ВСЕХ пользователей
     if not save_users(data):
         await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
         return
@@ -798,7 +968,7 @@ async def show_my_profile(callback):
     
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("⬅ Назад в меню", callback_data="back_main"))
-    await callback.message.answer(text, reply_markup=kb)
+    await callback.message.answer(text, reply_mup=kb)
 
 # --- Меню "Мои ученики" ---
 @dp.callback_query_handler(lambda c: c.data == "show_my_students")
@@ -1405,18 +1575,25 @@ async def daily_report():
 # --- RUN ---
 if __name__ == "__main__":
     print("=== Бот запускается ===")
-    print(f"ID Ольги: {OLGA_ID}")
-    print(f"ID Суперадмина: {YOUR_ADMIN_ID}")
-    print(f"Уровни: {LEVELS_ORDER}")
+    print("="*50)
+    print(f"👑 ID Ольги: {OLGA_ID}")
+    print(f"👑 ID Суперадмина: {YOUR_ADMIN_ID}")
+    print(f"📊 Уровни: {LEVELS_ORDER}")
+    print("="*50)
     
     # Загружаем данные
     data = load_users()
-    print(f"✅ Загружено пользователей: {len(data.get('users', {}))}")
+    user_count = len(data.get('users', {}))
+    print(f"✅ Загружено пользователей: {user_count}")
     
     # Проверяем backup файлы
     backup_files = [f for f in os.listdir('.') if f.startswith('users_backup_')]
+    corrupted_files = [f for f in os.listdir('.') if f.startswith('users_corrupted_')]
+    
     if backup_files:
         print(f"📂 Найдено backup файлов: {len(backup_files)}")
+    if corrupted_files:
+        print(f"⚠️ Найдено поврежденных файлов: {len(corrupted_files)}")
     
     loop = asyncio.get_event_loop()
     loop.run_until_complete(set_bot_commands())
@@ -1425,6 +1602,10 @@ if __name__ == "__main__":
     loop.create_task(daily_report())
     print("✅ Задача ежедневного отчета запущена")
     
-    print("✅ Бот запущен и готов к работе!")
-    print("💾 Данные защищены от потери")
+    print("="*50)
+    print("🚀 Бот запущен и готов к работе!")
+    print("🛡️  Данные защищены от потери")
+    print("🔧 Новые команды для админа: /check_data, /fix_data")
+    print("="*50)
+    
     executor.start_polling(dp, skip_updates=True)
