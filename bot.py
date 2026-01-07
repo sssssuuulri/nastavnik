@@ -2425,35 +2425,135 @@ async def receive_solution_from_student(message: types.Message, state):
     
     await state.finish()
 
-# --- НАСТАВНИК ОТВЕЧАЕТ УЧЕНИКУ ---
-@dp.callback_query_handler(lambda c: c.data.startswith("reply_to_student:"))
-async def reply_to_student_handler(callback: types.CallbackQuery):
-    """Наставник отвечает ученику на решение"""
-    parts = callback.data.split(":")
-    student_id = parts[1]
-    assignment_id = parts[2] if len(parts) > 2 else None
-    
-    # Сохраняем данные в состоянии
-    state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
-    await state.update_data(
-        reply_to_student=student_id,
-        reply_assignment_id=assignment_id
-    )
-    
-    await callback.message.answer(
-        "💬 <b>Ответ ученику</b>\n\n"
-        "Отправьте ваше сообщение ученику.\n"
-        "Это может быть:\n"
-        "• Обратная связь по решению\n"
-        "• Исправления\n"
-        "• Похвала\n"
-        "• Вопросы по решению\n\n"
-        "<i>Сообщение будет отправлено ученику и сохранено в истории</i>"
-    )
-    
-    await AssignmentStates.mentor_reply.set()
+# --- НАСТАВНИК ОТВЕЧАЕТ УЧЕНИКУ (ИСПРАВЛЕННЫЙ ОБРАБОТЧИК) ---
+@dp.callback_query_handler(lambda c: c.data.startswith("reply_to_student:"), state="*")
+async def handle_reply_to_student_button(callback: types.CallbackQuery):
+    """Наставник нажимает кнопку 'Ответить ученику'"""
+    try:
+        parts = callback.data.split(":")
+        student_id = parts[1]
+        assignment_id = parts[2] if len(parts) > 2 else None
+        
+        # Загружаем данные
+        users_data = load_users()["users"]
+        mentor_id = str(callback.from_user.id)
+        
+        # Проверяем, что наставник существует
+        if mentor_id not in users_data:
+            await callback.answer("Вы не зарегистрированы", show_alert=True)
+            return
+        
+        # Проверяем, что ученик существует
+        if student_id not in users_data:
+            await callback.answer("Ученик не найден", show_alert=True)
+            return
+        
+        # Проверяем, что наставник действительно наставник этого ученика
+        student = users_data[student_id]
+        if student.get("mentor") != mentor_id:
+            await callback.answer("Вы не являетесь наставником этого ученика", show_alert=True)
+            return
+        
+        # Сохраняем данные в состоянии
+        state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
+        await state.finish()  # Сбрасываем любое предыдущее состояние
+        
+        await state.update_data(
+            reply_to_student=student_id,
+            reply_assignment_id=assignment_id
+        )
+        
+        student_name = f"{student['name']} {student.get('surname','')}".strip()
+        
+        await callback.message.answer(
+            f"💬 <b>Ответ ученику</b>\n\n"
+            f"Вы отвечаете ученику: <b>{student_name}</b>\n\n"
+            "Отправьте ваше сообщение ученику.\n"
+            "Это может быть:\n"
+            "• Обратная связь по решению\n"
+            "• Исправления\n"
+            "• Похвала\n"
+            "• Вопросы по решению\n\n"
+            "<i>Сообщение будет отправлено ученику и сохранено в истории</i>",
+            parse_mode="HTML"
+        )
+        
+        await AssignmentStates.mentor_reply.set()
+        await callback.answer()  # Убираем "часики" на кнопке
+        
+    except Exception as e:
+        log_error(f"Ошибка в handle_reply_to_student_button: {e}")
+        await callback.answer("Ошибка обработки запроса", show_alert=True)
 
-# --- ПОЛУЧЕНИЕ ОТВЕТА ОТ НАСТАВНИКА ---
+# --- НАСТАВНИК ПРОСМАТРИВАЕТ ЗАДАНИЕ (ИСПРАВЛЕННЫЙ ОБРАБОТЧИК) ---
+@dp.callback_query_handler(lambda c: c.data.startswith("view_assignment:"), state="*")
+async def handle_view_assignment_button(callback: types.CallbackQuery):
+    """Наставник нажимает кнопку 'Просмотреть задание'"""
+    try:
+        assignment_id = callback.data.split(":")[1]
+        
+        assignments_data = load_assignments()
+        assignment = assignments_data.get("assignments", {}).get(assignment_id)
+        
+        if not assignment:
+            await callback.answer("Задание не найдено", show_alert=True)
+            return
+        
+        admin_name = assignment.get("admin_name", "Администратора")
+        levels = assignment.get("levels", [])
+        
+        text = f"📚 <b>ЗАДАНИЕ ОТ {admin_name.upper()}</b>\n\n"
+        text += f"• ID: <code>{assignment_id}</code>\n"
+        text += f"• Уровни: {', '.join(levels) if levels else 'Все ученики'}\n"
+        
+        # Форматируем время
+        timestamp = assignment.get("timestamp", "")
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                time_str = dt.strftime("%d.%m.%Y %H:%M")
+                text += f"• Время отправки: {time_str}\n"
+            except:
+                text += f"• Время: {timestamp}\n"
+        
+        text += f"• Отправлено ученикам: {assignment.get('sent_count', 0)}\n"
+        text += f"• Решений получено: {assignment.get('solutions_count', 0)}\n\n"
+        
+        if assignment.get("text"):
+            text += f"<b>Текст задания:</b>\n{assignment['text']}\n"
+        elif assignment.get("caption"):
+            text += f"<b>Задание:</b>\n{assignment['caption']}\n"
+        
+        # Получаем учеников, отправивших решения
+        solutions_sent = assignment.get("solutions_sent", [])
+        if solutions_sent:
+            text += f"\n<b>Ученики, отправившие решения:</b>\n"
+            
+            # Фильтруем только учеников этого наставника
+            mentor_students = [s for s in solutions_sent if s.get("mentor_id") == str(callback.from_user.id)]
+            
+            if mentor_students:
+                for i, solution in enumerate(mentor_students, 1):
+                    time_str = ""
+                    if solution.get('timestamp'):
+                        try:
+                            dt = datetime.fromisoformat(solution['timestamp'].replace('Z', '+00:00'))
+                            time_str = dt.strftime("%d.%m %H:%M")
+                        except:
+                            time_str = solution['timestamp']
+                    
+                    text += f"{i}. {solution.get('student_name', '?')} - {time_str}\n"
+            else:
+                text += "Ваши ученики еще не отправляли решения по этому заданию\n"
+        
+        await callback.message.answer(text, parse_mode="HTML")
+        await callback.answer()  # Убираем "часики" на кнопке
+        
+    except Exception as e:
+        log_error(f"Ошибка в handle_view_assignment_button: {e}")
+        await callback.answer("Ошибка загрузки задания", show_alert=True)
+
+# --- ПОЛУЧЕНИЕ ОТВЕТА ОТ НАСТАВНИКА (ОБНОВЛЕННЫЙ) ---
 @dp.message_handler(state=AssignmentStates.mentor_reply, content_types=types.ContentTypes.ANY)
 async def receive_mentor_reply(message: types.Message, state):
     """Получение ответа от наставника и отправка ученику"""
@@ -2547,8 +2647,8 @@ async def receive_mentor_reply(message: types.Message, state):
     
     await state.finish()
 
-# --- ПРОСМОТР ЗАДАНИЯ ---
-@dp.callback_query_handler(lambda c: c.data.startswith("view_assignment:"))
+# --- ПРОСМОТР ЗАДАНИЯ (ОБНОВЛЕННЫЙ) ---
+@dp.callback_query_handler(lambda c: c.data.startswith("view_assignment:"), state="*")
 async def view_assignment_handler(callback: types.CallbackQuery):
     """Наставник просматривает задание от администратора"""
     assignment_id = callback.data.split(":")[1]
@@ -2796,6 +2896,7 @@ if __name__ == "__main__":
     print("📊 Добавлены функции смены наставника и уровня")
     print("📚 Добавлена система заданий: Ольга/Суперадмин → ученики → наставники")
     print("🔄 Защита от длинных сообщений добавлена")
+    print("🔄 ИСПРАВЛЕНИЕ: Кнопки наставника теперь активны (state='*' добавлен)")
     print("="*50)
     
     executor.start_polling(dp, skip_updates=True)
