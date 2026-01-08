@@ -666,14 +666,14 @@ def save_users(data):
 def load_assignments():
     """Загрузка заданий и решений"""
     if not os.path.exists(ASSIGNMENTS_FILE):
-        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
+        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}, "active_dialogues": {}}
     
     try:
         with open(ASSIGNMENTS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
         log_error(f"❌ Ошибка загрузки assignments.json: {e}")
-        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
+        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}, "active_dialogues": {}}
 
 def save_assignments(data):
     """Сохранение заданий"""
@@ -684,6 +684,84 @@ def save_assignments(data):
     except Exception as e:
         log_error(f"❌ Ошибка сохранения assignments.json: {e}")
         return False
+
+# --- НОВЫЕ ФУНКЦИИ ДЛЯ УПРАВЛЕНИЯ ДИАЛОГАМИ ---
+def save_dialogue_state(mentor_id: str, student_id: str, assignment_id: str = None):
+    """Сохранение состояния активного диалога"""
+    assignments_data = load_assignments()
+    
+    # Сохраняем диалог для наставника
+    assignments_data.setdefault("active_dialogues", {})[mentor_id] = {
+        "with_student": student_id,
+        "assignment_id": assignment_id,
+        "started_at": str(datetime.now())
+    }
+    
+    # Сохраняем диалог для ученика
+    assignments_data.setdefault("active_dialogues", {})[student_id] = {
+        "with_mentor": mentor_id,
+        "assignment_id": assignment_id,
+        "started_at": str(datetime.now())
+    }
+    
+    return save_assignments(assignments_data)
+
+def end_dialogue(user_id: str):
+    """Завершение диалога для пользователя"""
+    assignments_data = load_assignments()
+    
+    if user_id in assignments_data.get("active_dialogues", {}):
+        # Находим собеседника
+        dialogue_info = assignments_data["active_dialogues"][user_id]
+        partner_id = dialogue_info.get("with_student") or dialogue_info.get("with_mentor")
+        
+        # Удаляем диалог для обоих участников
+        assignments_data["active_dialogues"].pop(user_id, None)
+        if partner_id:
+            assignments_data["active_dialogues"].pop(partner_id, None)
+        
+        save_assignments(assignments_data)
+        return partner_id
+    
+    return None
+
+def get_active_dialogue(user_id: str):
+    """Получение информации об активном диалоге"""
+    assignments_data = load_assignments()
+    return assignments_data.get("active_dialogues", {}).get(user_id)
+
+def save_dialogue_message(sender_id: str, receiver_id: str, message_data: dict):
+    """Сохранение сообщения в истории диалога"""
+    assignments_data = load_assignments()
+    
+    dialogue_id = f"{min(sender_id, receiver_id)}_{max(sender_id, receiver_id)}"
+    
+    if dialogue_id not in assignments_data.get("conversations", {}):
+        assignments_data["conversations"][dialogue_id] = {
+            "participants": [sender_id, receiver_id],
+            "messages": []
+        }
+    
+    message_record = {
+        "sender_id": sender_id,
+        "receiver_id": receiver_id,
+        "timestamp": str(datetime.now()),
+        "content_type": message_data.get("content_type"),
+        "text": message_data.get("text"),
+        "photo_id": message_data.get("photo_id"),
+        "document_id": message_data.get("document_id"),
+        "voice_id": message_data.get("voice_id"),
+        "caption": message_data.get("caption")
+    }
+    
+    assignments_data["conversations"][dialogue_id]["messages"].append(message_record)
+    
+    # Ограничиваем историю последними 100 сообщениями
+    if len(assignments_data["conversations"][dialogue_id]["messages"]) > 100:
+        assignments_data["conversations"][dialogue_id]["messages"] = \
+            assignments_data["conversations"][dialogue_id]["messages"][-100:]
+    
+    return save_assignments(assignments_data)
 
 # --- МЕНЮ КОМАНД ---
 async def set_bot_commands():
@@ -730,6 +808,11 @@ class Form(StatesGroup):
 class AssignmentStates(StatesGroup):
     waiting_for_solution = State()  # Ученик отправляет решение
     mentor_reply = State()          # Наставник отвечает ученику
+
+# НОВЫЕ СОСТОЯНИЯ ДЛЯ ДИАЛОГОВ
+class DialogueStates(StatesGroup):
+    in_dialogue_with_mentor = State()    # Ученик в диалоге с наставником
+    in_dialogue_with_student = State()   # Наставник в диалоге с учеником
 
 # --- АДМИН МЕНЮ ---
 async def admin_main_menu(user_id):
@@ -1008,6 +1091,12 @@ async def help_command(message: types.Message, state=None):
 • Изменять свой уровень (требуется подтверждение наставника)
 • Изменять наставника (требуется подтверждение нового наставника)
 • Просматривать решения заданий от своих учеников
+• Общаться с учениками в режиме диалога
+
+<b>Для учеников:</b>
+• Вы можете отправлять решения заданий наставнику
+• Общаться с наставником в режиме диалога
+• Менять уровень и наставника (с подтверждением)
 
 <b>Для администраторов:</b>
 • Доступны дополнительные команды (/admin, /stats, /broadcast, /check_data, /fix_data)
@@ -1488,7 +1577,7 @@ async def mentor_decline(callback):
             return
             
         # Разбираем callback_data - формат: "mentor_decline:user_id"
-        parts = callback_data.split(':')
+        parts = callback.data.split(':')
         
         # Проверяем, что есть все необходимые части
         if len(parts) < 2:
@@ -3207,11 +3296,11 @@ async def receive_solution_from_student(message: types.Message, state):
     
     if save_assignments(assignments_data):
         try:
-            # Отправляем решение наставнику
+            # Отправляем решение наставнику с кнопкой для ответа
             kb_mentor = InlineKeyboardMarkup(row_width=2)
             kb_mentor.add(
                 InlineKeyboardButton("💬 Ответить ученику", 
-                                   callback_data=f"reply_to_student:{student_id}:{assignment_id}"),
+                                   callback_data=f"start_dialogue:{student_id}:{assignment_id}"),
                 InlineKeyboardButton("👀 Просмотреть задание", 
                                    callback_data=f"view_assignment:{assignment_id}")
             )
@@ -3223,7 +3312,7 @@ async def receive_solution_from_student(message: types.Message, state):
                     f"👤 <b>Ученик:</b> {student_name}\n"
                     f"📚 <b>Задание от {admin_name}:</b>\n{assignment_text}\n\n"
                     f"<b>Решение ученика:</b>\n{message.text}\n\n"
-                    f"<i>Вы можете ответить ученику или просмотреть полное задание</i>",
+                    f"<i>Нажмите кнопку ниже, чтобы начать диалог с учеником</i>",
                     reply_markup=kb_mentor,
                     parse_mode="HTML"
                 )
@@ -3235,15 +3324,22 @@ async def receive_solution_from_student(message: types.Message, state):
                            f"👤 <b>Ученик:</b> {student_name}\n"
                            f"📚 <b>Задание от {admin_name}:</b>\n{assignment_text}\n\n"
                            f"<b>Решение ученика:</b>\n{message.caption or 'Фото решения'}\n\n"
-                           f"<i>Вы можете ответить ученику или просмотреть полное задание</i>",
+                           f"<i>Нажмите кнопку ниже, чтобы начать диалог с учеником</i>",
                     reply_markup=kb_mentor,
                     parse_mode="HTML"
                 )
             
-            # Уведомляем ученика
+            # Уведомляем ученика с кнопкой для диалога
+            kb_student = InlineKeyboardMarkup()
+            kb_student.add(
+                InlineKeyboardButton("💬 Начать диалог с наставником", 
+                                   callback_data=f"start_dialogue:{mentor_id}:{assignment_id}")
+            )
+            
             await message.answer(
                 f"✅ Ваше решение отправлено наставнику <b>{mentor_name}</b>!\n\n"
-                f"Ожидайте обратной связи. Наставник может ответить вам здесь."
+                f"Ожидайте обратной связи. Вы можете начать диалог с наставником, нажав кнопку ниже.",
+                reply_markup=kb_student
             )
             
             # Обновляем статистику задания
@@ -3272,127 +3368,302 @@ async def receive_solution_from_student(message: types.Message, state):
     
     await state.finish()
 
-# --- НАСТАВНИК ОТВЕЧАЕТ УЧЕНИКУ ---
-@dp.callback_query_handler(lambda c: c.data.startswith("reply_to_student:"))
-async def reply_to_student_handler(callback: types.CallbackQuery):
-    """Наставник отвечает ученику на решение"""
+# --- НАСТАВНИК НАЧИНАЕТ ДИАЛОГ С УЧЕНИКОМ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("start_dialogue:"))
+async def start_dialogue_handler(callback: types.CallbackQuery):
+    """Начало диалога между наставником и учеником"""
     parts = callback.data.split(":")
-    student_id = parts[1]
+    partner_id = parts[1]
     assignment_id = parts[2] if len(parts) > 2 else None
     
-    # Сохраняем данные в состоянии
-    state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
-    await state.update_data(
-        reply_to_student=student_id,
-        reply_assignment_id=assignment_id
-    )
-    
-    await callback.message.answer(
-        "💬 <b>Ответ ученику</b>\n\n"
-        "Отправьте ваше сообщение ученику.\n"
-        "Это может быть:\n"
-        "• Обратная связь по решению\n"
-        "• Исправления\n"
-        "• Похвала\n"
-        "• Вопросы по решению\n\n"
-        "<i>Сообщение будет отправлено ученику и сохранено в истории</i>"
-    )
-    
-    await AssignmentStates.mentor_reply.set()
-
-# --- ПОЛУЧЕНИЕ ОТВЕТА ОТ НАСТАВНИКА ---
-@dp.message_handler(state=AssignmentStates.mentor_reply, content_types=types.ContentTypes.ANY)
-async def receive_mentor_reply(message: types.Message, state):
-    """Получение ответа от наставника и отправка ученику"""
-    mentor_id = str(message.from_user.id)
-    data = await state.get_data()
-    
-    student_id = data.get("reply_to_student")
-    assignment_id = data.get("reply_assignment_id")
-    
-    if not student_id:
-        await message.answer("❌ Ошибка: ученик не указан")
-        await state.finish()
-        return
-    
-    # Загружаем данные
+    user_id = str(callback.from_user.id)
     users_data = load_users()["users"]
     
-    # Проверяем, что наставник действительно наставник этого ученика
-    student = users_data.get(student_id)
-    if not student or student.get("mentor") != mentor_id:
-        await message.answer("❌ Ошибка: вы не являетесь наставником этого ученика")
+    # Проверяем, существуют ли оба пользователя
+    if user_id not in users_data or partner_id not in users_data:
+        await callback.answer("Ошибка: пользователь не найден", show_alert=True)
+        return
+    
+    user = users_data[user_id]
+    partner = users_data[partner_id]
+    
+    # Проверяем отношения наставник-ученик
+    is_mentor_to_student = (user.get("mentor") == partner_id) or any(
+        u.get("mentor") == user_id for uid, u in users_data.items() if uid == partner_id
+    )
+    
+    if not is_mentor_to_student:
+        await callback.answer("Диалог возможен только между наставником и его учеником", show_alert=True)
+        return
+    
+    # Определяем, кто наставник, а кто ученик
+    if user.get("mentor") == partner_id:
+        # Пользователь - ученик, партнер - наставник
+        user_role = "ученик"
+        partner_role = "наставник"
+        user_state = DialogueStates.in_dialogue_with_mentor
+        partner_state = DialogueStates.in_dialogue_with_student
+    else:
+        # Пользователь - наставник, партнер - ученик
+        user_role = "наставник"
+        partner_role = "ученик"
+        user_state = DialogueStates.in_dialogue_with_student
+        partner_state = DialogueStates.in_dialogue_with_mentor
+    
+    # Сохраняем состояние диалога
+    save_dialogue_state(user_id, partner_id, assignment_id)
+    
+    # Уведомляем обоих пользователей
+    user_name = f"{user['name']} {user.get('surname','')}".strip()
+    partner_name = f"{partner['name']} {partner.get('surname','')}".strip()
+    
+    # Клавиатура для управления диалогом
+    kb_dialogue = InlineKeyboardMarkup(row_width=1)
+    kb_dialogue.add(
+        InlineKeyboardButton("🚫 Завершить диалог", callback_data="end_dialogue")
+    )
+    
+    # Сообщение для инициатора диалога
+    await callback.message.edit_text(
+        f"💬 <b>Диалог начат</b>\n\n"
+        f"Вы начали диалог с {partner_role} <b>{partner_name}</b>.\n"
+        f"Теперь все ваши сообщения будут пересылаться собеседнику.\n\n"
+        f"<i>Чтобы завершить диалог, нажмите кнопку ниже</i>",
+        reply_markup=kb_dialogue
+    )
+    
+    # Сообщение для собеседника
+    await bot.send_message(
+        partner_id,
+        f"💬 <b>Начат диалог</b>\n\n"
+        f"Ваш {user_role} <b>{user_name}</b> начал диалог с вами.\n"
+        f"Теперь все ваши сообщения будут пересылаться собеседнику.\n\n"
+        f"<i>Чтобы завершить диалог, нажмите кнопку ниже</i>",
+        reply_markup=kb_dialogue
+    )
+    
+    # Устанавливаем состояния для обоих пользователей
+    state_user = dp.current_state(user=int(user_id), chat=int(user_id))
+    await state_user.set(user_state)
+    await state_user.update_data(dialogue_with=partner_id, assignment_id=assignment_id)
+    
+    state_partner = dp.current_state(user=int(partner_id), chat=int(partner_id))
+    await state_partner.set(partner_state)
+    await state_partner.update_data(dialogue_with=user_id, assignment_id=assignment_id)
+    
+    await callback.answer("Диалог начат!")
+
+# --- ОБРАБОТКА СООБЩЕНИЙ В ДИАЛОГЕ ---
+@dp.message_handler(state=DialogueStates.in_dialogue_with_mentor, content_types=types.ContentTypes.ANY)
+async def handle_student_dialogue_message(message: types.Message, state):
+    """Обработка сообщений от ученика в диалоге с наставником"""
+    user_id = str(message.from_user.id)
+    data = await state.get_data()
+    mentor_id = data.get("dialogue_with")
+    
+    if not mentor_id:
+        await message.answer("❌ Ошибка: собеседник не найден")
         await state.finish()
         return
     
-    mentor = users_data.get(mentor_id)
+    # Получаем информацию о пользователях
+    users_data = load_users()["users"]
+    if user_id not in users_data or mentor_id not in users_data:
+        await message.answer("❌ Ошибка: пользователь не найден")
+        await state.finish()
+        return
+    
+    student = users_data[user_id]
+    mentor = users_data[mentor_id]
+    
     student_name = f"{student['name']} {student.get('surname','')}".strip()
     mentor_name = f"{mentor['name']} {mentor.get('surname','')}".strip()
     
-    # Сохраняем ответ в истории
-    assignments_data = load_assignments()
+    # Клавиатура для получателя
+    kb_receiver = InlineKeyboardMarkup()
+    kb_receiver.add(InlineKeyboardButton("🚫 Завершить диалог", callback_data="end_dialogue"))
     
-    reply_id = f"reply_{mentor_id}_{student_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Клавиатура для отправителя
+    kb_sender = InlineKeyboardMarkup()
+    kb_sender.add(InlineKeyboardButton("🚫 Завершить диалог", callback_data="end_dialogue"))
     
-    reply_info = {
-        "reply_id": reply_id,
-        "assignment_id": assignment_id,
-        "from_mentor": True,
-        "mentor_id": mentor_id,
-        "mentor_name": mentor_name,
-        "student_id": student_id,
-        "student_name": student_name,
-        "timestamp": str(datetime.now()),
-        "content_type": message.content_type
-    }
-    
-    if message.content_type == "text":
-        reply_info["text"] = message.text
-    elif message.content_type == "photo":
-        reply_info["photo_id"] = message.photo[-1].file_id
-        reply_info["caption"] = message.caption
-    
-    # Сохраняем в истории переписки
-    assignments_data.setdefault("conversations", {})[reply_id] = reply_info
-    
-    if save_assignments(assignments_data):
-        try:
-            # Отправляем ответ ученику
-            if message.content_type == "text":
-                await bot.send_message(
-                    student_id,
-                    f"💬 <b>ОТВЕТ ОТ ВАШЕГО НАСТАВНИКА</b>\n\n"
-                    f"👤 <b>Наставник:</b> {mentor_name}\n\n"
-                    f"{message.text}\n\n"
-                    f"<i>Вы можете продолжить диалог, просто отправляя сообщения сюда</i>"
-                )
-            elif message.content_type == "photo":
-                await bot.send_photo(
-                    student_id,
-                    message.photo[-1].file_id,
-                    caption=f"💬 <b>ОТВЕТ ОТ ВАШЕГО НАСТАВНИКА</b>\n\n"
-                           f"👤 <b>Наставник:</b> {mentor_name}\n\n"
-                           f"{message.caption or ''}\n\n"
-                           f"<i>Вы можете продолжить диалог, просто отправляя сообщения сюда</i>"
-                )
-            
-            # Уведомляем наставника
-            await message.answer(f"✅ Ответ отправлен ученику <b>{student_name}</b>")
-            
-            # Сохраняем состояние для продолжения диалога
-            state = dp.current_state(user=mentor_id, chat=mentor_id)
-            await state.update_data(
-                in_conversation_with=student_id,
-                conversation_assignment=assignment_id
+    try:
+        # Сохраняем сообщение в истории
+        message_data = {
+            "content_type": message.content_type,
+            "text": message.text if message.content_type == "text" else None,
+            "photo_id": message.photo[-1].file_id if message.content_type == "photo" else None,
+            "document_id": message.document.file_id if message.content_type == "document" else None,
+            "voice_id": message.voice.file_id if message.content_type == "voice" else None,
+            "caption": message.caption
+        }
+        
+        save_dialogue_message(user_id, mentor_id, message_data)
+        
+        # Отправляем сообщение наставнику
+        if message.content_type == "text":
+            await bot.send_message(
+                mentor_id,
+                f"💬 <b>Сообщение от ученика {student_name}</b>\n\n{message.text}",
+                reply_markup=kb_receiver,
+                parse_mode="HTML"
             )
-            
-        except Exception as e:
-            log_error(f"Ошибка отправки ответа ученику: {e}")
-            await message.answer(f"❌ Ошибка отправки ответа: {e}")
-    else:
-        await message.answer("❌ Ошибка сохранения ответа")
+        elif message.content_type == "photo":
+            await bot.send_photo(
+                mentor_id,
+                message.photo[-1].file_id,
+                caption=f"💬 <b>Сообщение от ученика {student_name}</b>\n\n{message.caption or ''}",
+                reply_markup=kb_receiver,
+                parse_mode="HTML"
+            )
+        elif message.content_type == "document":
+            await bot.send_document(
+                mentor_id,
+                message.document.file_id,
+                caption=f"💬 <b>Сообщение от ученика {student_name}</b>\n\n{message.caption or ''}",
+                reply_markup=kb_receiver,
+                parse_mode="HTML"
+            )
+        elif message.content_type == "voice":
+            await bot.send_voice(
+                mentor_id,
+                message.voice.file_id,
+                caption=f"💬 <b>Голосовое сообщение от ученика {student_name}</b>",
+                reply_markup=kb_receiver,
+                parse_mode="HTML"
+            )
+        
+        # Подтверждение для ученика
+        await message.answer(
+            f"✅ Сообщение отправлено наставнику <b>{mentor_name}</b>",
+            reply_markup=kb_sender
+        )
+        
+    except Exception as e:
+        log_error(f"Ошибка отправки сообщения в диалоге: {e}")
+        await message.answer(f"❌ Ошибка отправки сообщения: {e}")
+
+@dp.message_handler(state=DialogueStates.in_dialogue_with_student, content_types=types.ContentTypes.ANY)
+async def handle_mentor_dialogue_message(message: types.Message, state):
+    """Обработка сообщений от наставника в диалоге с учеником"""
+    user_id = str(message.from_user.id)
+    data = await state.get_data()
+    student_id = data.get("dialogue_with")
     
+    if not student_id:
+        await message.answer("❌ Ошибка: собеседник не найден")
+        await state.finish()
+        return
+    
+    # Получаем информацию о пользователях
+    users_data = load_users()["users"]
+    if user_id not in users_data or student_id not in users_data:
+        await message.answer("❌ Ошибка: пользователь не найден")
+        await state.finish()
+        return
+    
+    mentor = users_data[user_id]
+    student = users_data[student_id]
+    
+    mentor_name = f"{mentor['name']} {mentor.get('surname','')}".strip()
+    student_name = f"{student['name']} {student.get('surname','')}".strip()
+    
+    # Клавиатура для получателя
+    kb_receiver = InlineKeyboardMarkup()
+    kb_receiver.add(InlineKeyboardButton("🚫 Завершить диалог", callback_data="end_dialogue"))
+    
+    # Клавиатура для отправителя
+    kb_sender = InlineKeyboardMarkup()
+    kb_sender.add(InlineKeyboardButton("🚫 Завершить диалог", callback_data="end_dialogue"))
+    
+    try:
+        # Сохраняем сообщение в истории
+        message_data = {
+            "content_type": message.content_type,
+            "text": message.text if message.content_type == "text" else None,
+            "photo_id": message.photo[-1].file_id if message.content_type == "photo" else None,
+            "document_id": message.document.file_id if message.content_type == "document" else None,
+            "voice_id": message.voice.file_id if message.content_type == "voice" else None,
+            "caption": message.caption
+        }
+        
+        save_dialogue_message(user_id, student_id, message_data)
+        
+        # Отправляем сообщение ученику
+        if message.content_type == "text":
+            await bot.send_message(
+                student_id,
+                f"💬 <b>Сообщение от наставника {mentor_name}</b>\n\n{message.text}",
+                reply_markup=kb_receiver,
+                parse_mode="HTML"
+            )
+        elif message.content_type == "photo":
+            await bot.send_photo(
+                student_id,
+                message.photo[-1].file_id,
+                caption=f"💬 <b>Сообщение от наставника {mentor_name}</b>\n\n{message.caption or ''}",
+                reply_markup=kb_receiver,
+                parse_mode="HTML"
+            )
+        elif message.content_type == "document":
+            await bot.send_document(
+                student_id,
+                message.document.file_id,
+                caption=f"💬 <b>Сообщение от наставника {mentor_name}</b>\n\n{message.caption or ''}",
+                reply_markup=kb_receiver,
+                parse_mode="HTML"
+            )
+        elif message.content_type == "voice":
+            await bot.send_voice(
+                student_id,
+                message.voice.file_id,
+                caption=f"💬 <b>Голосовое сообщение от наставника {mentor_name}</b>",
+                reply_markup=kb_receiver,
+                parse_mode="HTML"
+            )
+        
+        # Подтверждение для наставника
+        await message.answer(
+            f"✅ Сообщение отправлено ученику <b>{student_name}</b>",
+            reply_markup=kb_sender
+        )
+        
+    except Exception as e:
+        log_error(f"Ошибка отправки сообщения в диалоге: {e}")
+        await message.answer(f"❌ Ошибка отправки сообщения: {e}")
+
+# --- ЗАВЕРШЕНИЕ ДИАЛОГА ---
+@dp.callback_query_handler(lambda c: c.data == "end_dialogue", state=[DialogueStates.in_dialogue_with_mentor, DialogueStates.in_dialogue_with_student])
+async def end_dialogue_handler(callback: types.CallbackQuery, state):
+    """Завершение диалога"""
+    user_id = str(callback.from_user.id)
+    
+    # Завершаем диалог в базе данных
+    partner_id = end_dialogue(user_id)
+    
+    if partner_id:
+        # Уведомляем собеседника
+        users_data = load_users()["users"]
+        if user_id in users_data:
+            user_name = f"{users_data[user_id]['name']} {users_data[user_id].get('surname','')}".strip()
+            await bot.send_message(
+                partner_id,
+                f"🚫 <b>Диалог завершен</b>\n\n"
+                f"Собеседник <b>{user_name}</b> завершил диалог.\n"
+                f"Теперь вы можете начать новый диалог или отправить сообщение через меню."
+            )
+    
+    # Сбрасываем состояние
     await state.finish()
+    
+    # Уведомляем пользователя
+    await callback.message.edit_text(
+        f"🚫 <b>Диалог завершен</b>\n\n"
+        f"Вы завершили диалог с собеседником.\n"
+        f"Теперь вы можете начать новый диалог или отправить сообщение через меню."
+    )
+    
+    await callback.answer("Диалог завершен")
 
 # --- ПРОСМОТР ЗАДАНИЯ ---
 @dp.callback_query_handler(lambda c: c.data.startswith("view_assignment:"))
@@ -3645,8 +3916,12 @@ if __name__ == "__main__":
         assignments_data = load_assignments()
         assignments_count = len(assignments_data.get('assignments', {}))
         solutions_count = len(assignments_data.get('solutions', {}))
+        conversations_count = len(assignments_data.get('conversations', {}))
+        active_dialogues_count = len(assignments_data.get('active_dialogues', {}))
         print(f"📚 Загружено заданий: {assignments_count}")
         print(f"📝 Загружено решений: {solutions_count}")
+        print(f"💬 Загружено диалогов: {conversations_count}")
+        print(f"🔗 Активных диалогов: {active_dialogues_count}")
     else:
         print(f"📚 Файл заданий создан")
     
@@ -3679,6 +3954,11 @@ if __name__ == "__main__":
     print("📊 Добавлены функции смены наставника и уровня")
     print("📚 Добавлена система заданий: Ольга/Суперадмин → ученики → наставники")
     print("🔄 Защита от длинных сообщений добавлена")
+    print("💬 ДОБАВЛЕНА СИСТЕМА НЕПРЕРЫВНЫХ ДИАЛОГОВ:")
+    print("   • Автоматическая пересылка сообщений между учеником и наставником")
+    print("   • Кнопка 'Завершить диалог' для обеих сторон")
+    print("   • Сохранение истории всех сообщений")
+    print("   • Поддержка всех типов контента (текст, фото, документы, голос)")
     print("="*50)
     print("🆕 ДОБАВЛЕНЫ НОВЫЕ ФУНКЦИИ:")
     print("   📊 Детальный отчет по рассылкам с группировкой ошибок")
