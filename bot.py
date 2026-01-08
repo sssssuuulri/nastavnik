@@ -277,14 +277,14 @@ def save_users(data):
 def load_assignments():
     """Загрузка заданий и решений"""
     if not os.path.exists(ASSIGNMENTS_FILE):
-        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}, "active_dialogs": {}}
+        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
     
     try:
         with open(ASSIGNMENTS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
         log_error(f"❌ Ошибка загрузки assignments.json: {e}")
-        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}, "active_dialogs": {}}
+        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
 
 def save_assignments(data):
     """Сохранение заданий"""
@@ -341,8 +341,6 @@ class Form(StatesGroup):
 class AssignmentStates(StatesGroup):
     waiting_for_solution = State()  # Ученик отправляет решение
     mentor_reply = State()          # Наставник отвечает ученику
-    student_continue = State()      # Ученик продолжает диалог
-    mentor_continue = State()       # Наставник продолжает диалог
 
 # --- АДМИН МЕНЮ ---
 async def admin_main_menu(user_id):
@@ -621,12 +619,6 @@ async def help_command(message: types.Message, state=None):
 • Изменять свой уровень (требуется подтверждение наставника)
 • Изменять наставника (требуется подтверждение нового наставника)
 • Просматривать решения заданий от своих учеников
-• Общаться с учениками после получения их решений
-
-<b>Для учеников:</b>
-• Вы можете отправлять решения заданий наставникам
-• Получать обратную связь от наставников
-• Продолжать диалог с наставником после получения ответа
 
 <b>Для администраторов:</b>
 • Доступны дополнительные команды (/admin, /stats, /broadcast, /check_data, /fix_data)
@@ -2404,20 +2396,8 @@ async def receive_solution_from_student(message: types.Message, state):
             # Уведомляем ученика
             await message.answer(
                 f"✅ Ваше решение отправлено наставнику <b>{mentor_name}</b>!\n\n"
-                f"Ожидайте обратной связи. Наставник может ответить вам здесь. "
-                f"Вы также можете продолжить диалог, просто отправляя сообщения сюда."
+                f"Ожидайте обратной связи. Наставник может ответить вам здесь."
             )
-            
-            # Регистрируем активный диалог
-            assignments_data.setdefault("active_dialogs", {})[f"{student_id}_{mentor_id}"] = {
-                "student_id": student_id,
-                "mentor_id": mentor_id,
-                "assignment_id": assignment_id,
-                "last_activity": str(datetime.now()),
-                "initiated_by": "student"
-            }
-            
-            save_assignments(assignments_data)
             
             # Обновляем статистику задания
             if assignment_id in assignments_data.get("assignments", {}):
@@ -2445,135 +2425,35 @@ async def receive_solution_from_student(message: types.Message, state):
     
     await state.finish()
 
-# --- НАСТАВНИК ОТВЕЧАЕТ УЧЕНИКУ (ИСПРАВЛЕННЫЙ ОБРАБОТЧИК) ---
-@dp.callback_query_handler(lambda c: c.data.startswith("reply_to_student:"), state="*")
-async def handle_reply_to_student_button(callback: types.CallbackQuery):
-    """Наставник нажимает кнопку 'Ответить ученику'"""
-    try:
-        parts = callback.data.split(":")
-        student_id = parts[1]
-        assignment_id = parts[2] if len(parts) > 2 else None
-        
-        # Загружаем данные
-        users_data = load_users()["users"]
-        mentor_id = str(callback.from_user.id)
-        
-        # Проверяем, что наставник существует
-        if mentor_id not in users_data:
-            await callback.answer("Вы не зарегистрированы", show_alert=True)
-            return
-        
-        # Проверяем, что ученик существует
-        if student_id not in users_data:
-            await callback.answer("Ученик не найден", show_alert=True)
-            return
-        
-        # Проверяем, что наставник действительно наставник этого ученика
-        student = users_data[student_id]
-        if student.get("mentor") != mentor_id:
-            await callback.answer("Вы не являетесь наставником этого ученика", show_alert=True)
-            return
-        
-        # Сохраняем данные в состоянии
-        state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
-        await state.finish()  # Сбрасываем любое предыдущее состояние
-        
-        await state.update_data(
-            reply_to_student=student_id,
-            reply_assignment_id=assignment_id
-        )
-        
-        student_name = f"{student['name']} {student.get('surname','')}".strip()
-        
-        await callback.message.answer(
-            f"💬 <b>Ответ ученику</b>\n\n"
-            f"Вы отвечаете ученику: <b>{student_name}</b>\n\n"
-            "Отправьте ваше сообщение ученику.\n"
-            "Это может быть:\n"
-            "• Обратная связь по решению\n"
-            "• Исправления\n"
-            "• Похвала\n"
-            "• Вопросы по решению\n\n"
-            "<i>Сообщение будет отправлено ученику и сохранено в истории</i>",
-            parse_mode="HTML"
-        )
-        
-        await AssignmentStates.mentor_reply.set()
-        await callback.answer()  # Убираем "часики" на кнопке
-        
-    except Exception as e:
-        log_error(f"Ошибка в handle_reply_to_student_button: {e}")
-        await callback.answer("Ошибка обработки запроса", show_alert=True)
+# --- НАСТАВНИК ОТВЕЧАЕТ УЧЕНИКУ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("reply_to_student:"))
+async def reply_to_student_handler(callback: types.CallbackQuery):
+    """Наставник отвечает ученику на решение"""
+    parts = callback.data.split(":")
+    student_id = parts[1]
+    assignment_id = parts[2] if len(parts) > 2 else None
+    
+    # Сохраняем данные в состоянии
+    state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
+    await state.update_data(
+        reply_to_student=student_id,
+        reply_assignment_id=assignment_id
+    )
+    
+    await callback.message.answer(
+        "💬 <b>Ответ ученику</b>\n\n"
+        "Отправьте ваше сообщение ученику.\n"
+        "Это может быть:\n"
+        "• Обратная связь по решению\n"
+        "• Исправления\n"
+        "• Похвала\n"
+        "• Вопросы по решению\n\n"
+        "<i>Сообщение будет отправлено ученику и сохранено в истории</i>"
+    )
+    
+    await AssignmentStates.mentor_reply.set()
 
-# --- НАСТАВНИК ПРОСМАТРИВАЕТ ЗАДАНИЕ (ИСПРАВЛЕННЫЙ ОБРАБОТЧИК) ---
-@dp.callback_query_handler(lambda c: c.data.startswith("view_assignment:"), state="*")
-async def handle_view_assignment_button(callback: types.CallbackQuery):
-    """Наставник нажимает кнопку 'Просмотреть задание'"""
-    try:
-        assignment_id = callback.data.split(":")[1]
-        
-        assignments_data = load_assignments()
-        assignment = assignments_data.get("assignments", {}).get(assignment_id)
-        
-        if not assignment:
-            await callback.answer("Задание не найдено", show_alert=True)
-            return
-        
-        admin_name = assignment.get("admin_name", "Администратора")
-        levels = assignment.get("levels", [])
-        
-        text = f"📚 <b>ЗАДАНИЕ ОТ {admin_name.upper()}</b>\n\n"
-        text += f"• ID: <code>{assignment_id}</code>\n"
-        text += f"• Уровни: {', '.join(levels) if levels else 'Все ученики'}\n"
-        
-        # Форматируем время
-        timestamp = assignment.get("timestamp", "")
-        if timestamp:
-            try:
-                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                time_str = dt.strftime("%d.%m.%Y %H:%M")
-                text += f"• Время отправки: {time_str}\n"
-            except:
-                text += f"• Время: {timestamp}\n"
-        
-        text += f"• Отправлено ученикам: {assignment.get('sent_count', 0)}\n"
-        text += f"• Решений получено: {assignment.get('solutions_count', 0)}\n\n"
-        
-        if assignment.get("text"):
-            text += f"<b>Текст задания:</b>\n{assignment['text']}\n"
-        elif assignment.get("caption"):
-            text += f"<b>Задание:</b>\n{assignment['caption']}\n"
-        
-        # Получаем учеников, отправивших решения
-        solutions_sent = assignment.get("solutions_sent", [])
-        if solutions_sent:
-            text += f"\n<b>Ученики, отправившие решения:</b>\n"
-            
-            # Фильтруем только учеников этого наставника
-            mentor_students = [s for s in solutions_sent if s.get("mentor_id") == str(callback.from_user.id)]
-            
-            if mentor_students:
-                for i, solution in enumerate(mentor_students, 1):
-                    time_str = ""
-                    if solution.get('timestamp'):
-                        try:
-                            dt = datetime.fromisoformat(solution['timestamp'].replace('Z', '+00:00'))
-                            time_str = dt.strftime("%d.%m %H:%M")
-                        except:
-                            time_str = solution['timestamp']
-                    
-                    text += f"{i}. {solution.get('student_name', '?')} - {time_str}\n"
-            else:
-                text += "Ваши ученики еще не отправляли решения по этому заданию\n"
-        
-        await callback.message.answer(text, parse_mode="HTML")
-        await callback.answer()  # Убираем "часики" на кнопке
-        
-    except Exception as e:
-        log_error(f"Ошибка в handle_view_assignment_button: {e}")
-        await callback.answer("Ошибка загрузки задания", show_alert=True)
-
-# --- ПОЛУЧЕНИЕ ОТВЕТА ОТ НАСТАВНИКА (ОБНОВЛЕННЫЙ) ---
+# --- ПОЛУЧЕНИЕ ОТВЕТА ОТ НАСТАВНИКА ---
 @dp.message_handler(state=AssignmentStates.mentor_reply, content_types=types.ContentTypes.ANY)
 async def receive_mentor_reply(message: types.Message, state):
     """Получение ответа от наставника и отправка ученику"""
@@ -2628,15 +2508,6 @@ async def receive_mentor_reply(message: types.Message, state):
     # Сохраняем в истории переписки
     assignments_data.setdefault("conversations", {})[reply_id] = reply_info
     
-    # Обновляем активный диалог
-    assignments_data.setdefault("active_dialogs", {})[f"{student_id}_{mentor_id}"] = {
-        "student_id": student_id,
-        "mentor_id": mentor_id,
-        "assignment_id": assignment_id,
-        "last_activity": str(datetime.now()),
-        "initiated_by": "mentor"
-    }
-    
     if save_assignments(assignments_data):
         try:
             # Отправляем ответ ученику
@@ -2659,8 +2530,14 @@ async def receive_mentor_reply(message: types.Message, state):
                 )
             
             # Уведомляем наставника
-            await message.answer(f"✅ Ответ отправлен ученику <b>{student_name}</b>\n\n"
-                               f"Вы также можете продолжить диалог, отправляя сообщения сюда.")
+            await message.answer(f"✅ Ответ отправлен ученику <b>{student_name}</b>")
+            
+            # Сохраняем состояние для продолжения диалога
+            state = dp.current_state(user=mentor_id, chat=mentor_id)
+            await state.update_data(
+                in_conversation_with=student_id,
+                conversation_assignment=assignment_id
+            )
             
         except Exception as e:
             log_error(f"Ошибка отправки ответа ученику: {e}")
@@ -2670,251 +2547,8 @@ async def receive_mentor_reply(message: types.Message, state):
     
     await state.finish()
 
-# --- ПРОДОЛЖЕНИЕ ДИАЛОГА УЧЕНИКОМ (НОВАЯ ФУНКЦИЯ) ---
-@dp.message_handler(lambda message: check_if_student_has_active_dialog(message), content_types=types.ContentTypes.ANY)
-async def handle_student_continue_dialog(message: types.Message):
-    """Ученик продолжает диалог с наставником"""
-    student_id = str(message.from_user.id)
-    
-    # Загружаем данные
-    assignments_data = load_assignments()
-    active_dialogs = assignments_data.get("active_dialogs", {})
-    users_data = load_users()["users"]
-    
-    # Ищем активный диалог этого ученика
-    dialog_key = None
-    mentor_id = None
-    
-    for key, dialog in active_dialogs.items():
-        if dialog.get("student_id") == student_id:
-            dialog_key = key
-            mentor_id = dialog.get("mentor_id")
-            break
-    
-    if not mentor_id:
-        # Если нет активного диалога, проверяем наличие наставника
-        if student_id in users_data and users_data[student_id].get("mentor"):
-            mentor_id = users_data[student_id].get("mentor")
-            # Создаем новый диалог
-            dialog_key = f"{student_id}_{mentor_id}"
-            assignments_data.setdefault("active_dialogs", {})[dialog_key] = {
-                "student_id": student_id,
-                "mentor_id": mentor_id,
-                "last_activity": str(datetime.now()),
-                "initiated_by": "student"
-            }
-            save_assignments(assignments_data)
-        else:
-            # Ученик не в диалоге и нет наставника
-            await message.answer("ℹ️ Чтобы начать диалог с наставником, сначала отправьте решение задания.")
-            return
-    
-    # Проверяем, что наставник существует
-    if mentor_id not in users_data:
-        await message.answer("❌ Ваш наставник не найден в системе")
-        return
-    
-    student = users_data[student_id]
-    mentor = users_data[mentor_id]
-    
-    student_name = f"{student['name']} {student.get('surname','')}".strip()
-    mentor_name = f"{mentor['name']} {mentor.get('surname','')}".strip()
-    
-    # Сохраняем сообщение в истории
-    message_id = f"msg_{student_id}_{mentor_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    message_info = {
-        "message_id": message_id,
-        "from_student": True,
-        "student_id": student_id,
-        "student_name": student_name,
-        "mentor_id": mentor_id,
-        "mentor_name": mentor_name,
-        "timestamp": str(datetime.now()),
-        "content_type": message.content_type
-    }
-    
-    if message.content_type == "text":
-        message_info["text"] = message.text
-    elif message.content_type == "photo":
-        message_info["photo_id"] = message.photo[-1].file_id
-        message_info["caption"] = message.caption
-    
-    # Сохраняем в истории переписки
-    assignments_data.setdefault("conversations", {})[message_id] = message_info
-    
-    # Обновляем активный диалог
-    if dialog_key in assignments_data.get("active_dialogs", {}):
-        assignments_data["active_dialogs"][dialog_key]["last_activity"] = str(datetime.now())
-        assignments_data["active_dialogs"][dialog_key]["initiated_by"] = "student"
-    
-    if save_assignments(assignments_data):
-        try:
-            # Отправляем сообщение наставнику
-            if message.content_type == "text":
-                await bot.send_message(
-                    mentor_id,
-                    f"💬 <b>СООБЩЕНИЕ ОТ УЧЕНИКА</b>\n\n"
-                    f"👤 <b>Ученик:</b> {student_name}\n\n"
-                    f"{message.text}\n\n"
-                    f"<i>Вы можете ответить ученику, просто отправляя сообщения сюда</i>"
-                )
-            elif message.content_type == "photo":
-                await bot.send_photo(
-                    mentor_id,
-                    message.photo[-1].file_id,
-                    caption=f"💬 <b>СООБЩЕНИЕ ОТ УЧЕНИКА</b>\n\n"
-                           f"👤 <b>Ученик:</b> {student_name}\n\n"
-                           f"{message.caption or ''}\n\n"
-                           f"<i>Вы можете ответить ученику, просто отправляя сообщения сюда</i>"
-                )
-            
-            # Уведомляем ученика
-            await message.answer(f"✅ Сообщение отправлено наставнику <b>{mentor_name}</b>")
-            
-        except Exception as e:
-            log_error(f"Ошибка отправки сообщения наставнику: {e}")
-            await message.answer(f"❌ Ошибка отправки сообщения: {e}")
-    else:
-        await message.answer("❌ Ошибка сохранения сообщения")
-
-def check_if_student_has_active_dialog(message: types.Message):
-    """Проверяет, есть ли у ученика активный диалог или наставник"""
-    if message.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]:
-        return False
-    
-    student_id = str(message.from_user.id)
-    
-    # Загружаем данные
-    assignments_data = load_assignments()
-    active_dialogs = assignments_data.get("active_dialogs", {})
-    users_data = load_users()["users"]
-    
-    # Проверяем активные диалоги
-    for dialog in active_dialogs.values():
-        if dialog.get("student_id") == student_id:
-            return True
-    
-    # Проверяем наличие наставника
-    if student_id in users_data and users_data[student_id].get("mentor"):
-        return True
-    
-    return False
-
-# --- ПРОДОЛЖЕНИЕ ДИАЛОГА НАСТАВНИКОМ (НОВАЯ ФУНКЦИЯ) ---
-@dp.message_handler(lambda message: check_if_mentor_has_active_dialog(message), content_types=types.ContentTypes.ANY)
-async def handle_mentor_continue_dialog(message: types.Message):
-    """Наставник продолжает диалог с учеником"""
-    mentor_id = str(message.from_user.id)
-    
-    # Загружаем данные
-    assignments_data = load_assignments()
-    active_dialogs = assignments_data.get("active_dialogs", {})
-    users_data = load_users()["users"]
-    
-    # Ищем активный диалог этого наставника
-    dialog_key = None
-    student_id = None
-    
-    for key, dialog in active_dialogs.items():
-        if dialog.get("mentor_id") == mentor_id:
-            dialog_key = key
-            student_id = dialog.get("student_id")
-            break
-    
-    if not student_id:
-        await message.answer("ℹ️ У вас нет активных диалогов. Чтобы начать диалог, ответьте на решение ученика.")
-        return
-    
-    # Проверяем, что ученик существует
-    if student_id not in users_data:
-        await message.answer("❌ Ученик не найден в системе")
-        return
-    
-    student = users_data[student_id]
-    mentor = users_data[mentor_id]
-    
-    student_name = f"{student['name']} {student.get('surname','')}".strip()
-    mentor_name = f"{mentor['name']} {mentor.get('surname','')}".strip()
-    
-    # Сохраняем сообщение в истории
-    message_id = f"msg_{mentor_id}_{student_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    message_info = {
-        "message_id": message_id,
-        "from_mentor": True,
-        "student_id": student_id,
-        "student_name": student_name,
-        "mentor_id": mentor_id,
-        "mentor_name": mentor_name,
-        "timestamp": str(datetime.now()),
-        "content_type": message.content_type
-    }
-    
-    if message.content_type == "text":
-        message_info["text"] = message.text
-    elif message.content_type == "photo":
-        message_info["photo_id"] = message.photo[-1].file_id
-        message_info["caption"] = message.caption
-    
-    # Сохраняем в истории переписки
-    assignments_data.setdefault("conversations", {})[message_id] = message_info
-    
-    # Обновляем активный диалог
-    if dialog_key in assignments_data.get("active_dialogs", {}):
-        assignments_data["active_dialogs"][dialog_key]["last_activity"] = str(datetime.now())
-        assignments_data["active_dialogs"][dialog_key]["initiated_by"] = "mentor"
-    
-    if save_assignments(assignments_data):
-        try:
-            # Отправляем сообщение ученику
-            if message.content_type == "text":
-                await bot.send_message(
-                    student_id,
-                    f"💬 <b>СООБЩЕНИЕ ОТ НАСТАВНИКА</b>\n\n"
-                    f"👤 <b>Наставник:</b> {mentor_name}\n\n"
-                    f"{message.text}\n\n"
-                    f"<i>Вы можете ответить наставнику, просто отправляя сообщения сюда</i>"
-                )
-            elif message.content_type == "photo":
-                await bot.send_photo(
-                    student_id,
-                    message.photo[-1].file_id,
-                    caption=f"💬 <b>СООБЩЕНИЕ ОТ НАСТАВНИКА</b>\n\n"
-                           f"👤 <b>Наставник:</b> {mentor_name}\n\n"
-                           f"{message.caption or ''}\n\n"
-                           f"<i>Вы можете ответить наставнику, просто отправляя сообщения сюда</i>"
-                )
-            
-            # Уведомляем наставника
-            await message.answer(f"✅ Сообщение отправлено ученику <b>{student_name}</b>")
-            
-        except Exception as e:
-            log_error(f"Ошибка отправки сообщения ученику: {e}")
-            await message.answer(f"❌ Ошибка отправки сообщения: {e}")
-    else:
-        await message.answer("❌ Ошибка сохранения сообщения")
-
-def check_if_mentor_has_active_dialog(message: types.Message):
-    """Проверяет, есть ли у наставника активный диалог"""
-    if message.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]:
-        return False
-    
-    mentor_id = str(message.from_user.id)
-    
-    # Загружаем данные
-    assignments_data = load_assignments()
-    active_dialogs = assignments_data.get("active_dialogs", {})
-    
-    # Проверяем активные диалоги
-    for dialog in active_dialogs.values():
-        if dialog.get("mentor_id") == mentor_id:
-            return True
-    
-    return False
-
-# --- ПРОСМОТР ЗАДАНИЯ (ОБНОВЛЕННЫЙ) ---
-@dp.callback_query_handler(lambda c: c.data.startswith("view_assignment:"), state="*")
+# --- ПРОСМОТР ЗАДАНИЯ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("view_assignment:"))
 async def view_assignment_handler(callback: types.CallbackQuery):
     """Наставник просматривает задание от администратора"""
     assignment_id = callback.data.split(":")[1]
@@ -3037,11 +2671,13 @@ async def confirm_send(callback, state):
     data = await state.get_data()
     message = data.get("message_to_send")
     recipients = data.get("recipients", [])
+    recipient_names = data.get("recipient_names", [])
     
     await callback.message.edit_text(f"🔄 Отправляю {len(recipients)} сообщений...")
     
     sent_count = 0
     failed_count = 0
+    failed_users = []  # СОХРАНЯЕМ КТО НЕ ПОЛУЧИЛ
     
     for i, uid in enumerate(recipients):
         try:
@@ -3063,16 +2699,72 @@ async def confirm_send(callback, state):
                 
         except Exception as e:
             failed_count += 1
-            log_info(f"Ошибка отправки {uid}: {e}")
+            # СОХРАНЯЕМ ИНФОРМАЦИЮ О ТОМ, КТО НЕ ПОЛУЧИЛ
+            user_name = recipient_names[i] if i < len(recipient_names) else f"Пользователь {uid}"
+            failed_users.append({
+                "id": uid,
+                "name": user_name,
+                "error": str(e)
+            })
+            log_info(f"Ошибка отправки {uid} ({user_name}): {e}")
+    
+    # СОХРАНЯЕМ ИНФОРМАЦИЮ О НЕУДАЧНЫХ ОТПРАВКАХ
+    await state.update_data(failed_users=failed_users)
+    
+    # СОЗДАЕМ КНОПКУ ДЛЯ ПРОСМОТРА СПИСКА НЕУДАЧНЫХ
+    kb = InlineKeyboardMarkup()
+    
+    if failed_users:
+        kb.add(InlineKeyboardButton("❌ Показать кому не дошло", callback_data="failed_list"))
     
     await callback.message.edit_text(
         f"✅ Рассылка завершена!\n\n"
         f"• Отправлено: {sent_count}\n"
-        f"• Не отправлено: {failed_count}"
+        f"• Не отправлено: {failed_count}",
+        reply_markup=kb if failed_users else None
     )
     
     await state.finish()
-    await admin_main_menu(callback.from_user.id)
+
+# --- ПОКАЗАТЬ СПИСОК НЕУДАЧНЫХ ОТПРАВОК ---
+@dp.callback_query_handler(lambda c: c.data == "failed_list", state="*")
+async def show_failed_list(callback, state):
+    """Показать список тех, кому не дошла рассылка"""
+    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    
+    # Получаем данные из состояния или из текущего контекста
+    if state:
+        data = await state.get_data()
+    else:
+        # Если state не активен, пытаемся получить данные из callback
+        data = {}
+    
+    failed_users = data.get("failed_users", [])
+    
+    if not failed_users:
+        await callback.answer("Нет информации о неудачных отправках", show_alert=True)
+        return
+    
+    text = f"❌ <b>Не удалось отправить ({len(failed_users)}):</b>\n\n"
+    
+    for i, user_info in enumerate(failed_users, 1):
+        text += f"{i}. {user_info['name']} (ID: {user_info['id']})"
+        if user_info.get('error'):
+            error_msg = user_info['error']
+            if len(error_msg) > 50:
+                error_msg = error_msg[:50] + "..."
+            text += f"\n   Ошибка: {error_msg}\n"
+        else:
+            text += "\n"
+        
+        if i >= 20:  # Ограничиваем вывод
+            text += f"\n... и еще {len(failed_users) - 20} пользователей"
+            break
+    
+    await callback.message.answer(text, parse_mode="HTML")
+    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "cancel_send", state=Form.admin_message)
 async def cancel_send(callback, state):
@@ -3143,12 +2835,8 @@ if __name__ == "__main__":
         assignments_data = load_assignments()
         assignments_count = len(assignments_data.get('assignments', {}))
         solutions_count = len(assignments_data.get('solutions', {}))
-        conversations_count = len(assignments_data.get('conversations', {}))
-        active_dialogs = len(assignments_data.get('active_dialogs', {}))
         print(f"📚 Загружено заданий: {assignments_count}")
         print(f"📝 Загружено решений: {solutions_count}")
-        print(f"💬 Загружено сообщений диалогов: {conversations_count}")
-        print(f"🔄 Активных диалогов: {active_dialogs}")
     else:
         print(f"📚 Файл заданий создан")
     
@@ -3166,8 +2854,7 @@ if __name__ == "__main__":
     print("📊 Добавлены функции смены наставника и уровня")
     print("📚 Добавлена система заданий: Ольга/Суперадмин → ученики → наставники")
     print("🔄 Защита от длинных сообщений добавлена")
-    print("💬 ДОБАВЛЕНО: Продолжение диалога между учениками и наставниками!")
-    print("🔄 ИСПРАВЛЕНИЕ: Кнопки наставника теперь активны (state='*' добавлен)")
+    print("✅ ДОБАВЛЕНО: Просмотр списка тех, кому не дошла рассылка")
     print("="*50)
     
     executor.start_polling(dp, skip_updates=True)
