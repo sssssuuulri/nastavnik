@@ -413,6 +413,7 @@ async def admin_main_menu(user_id):
     kb = InlineKeyboardMarkup(row_width=1)
     
     kb.add(InlineKeyboardButton("👑 Админ-панель", callback_data="admin_panel"))
+    kb.add(InlineKeyboardButton("💬 Все диалоги", callback_data="admin_view_conversations"))  # ПЕРЕМЕЩЕНО ВВЕРХ!
     
     # Проверяем, зарегистрирован ли пользователь
     data = load_users()
@@ -426,7 +427,6 @@ async def admin_main_menu(user_id):
         kb.add(InlineKeyboardButton("👤 Зарегистрироваться", callback_data="register_as_admin"))
     
     kb.add(InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
-    kb.add(InlineKeyboardButton("💬 Все диалоги", callback_data="admin_view_conversations"))  # ВСЕГДА показываем эту кнопку
     
     if user_id == YOUR_ADMIN_ID:
         kb.add(InlineKeyboardButton("🌐 Все пользователи", callback_data="all_users"))
