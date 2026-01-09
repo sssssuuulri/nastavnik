@@ -413,7 +413,12 @@ async def admin_main_menu(user_id):
     kb = InlineKeyboardMarkup(row_width=1)
     
     kb.add(InlineKeyboardButton("👑 Админ-панель", callback_data="admin_panel"))
-    kb.add(InlineKeyboardButton("💬 Все диалоги", callback_data="admin_view_conversations"))  # ПЕРЕМЕЩЕНО ВВЕРХ!
+    
+    # ВАЖНОЕ ИЗМЕНЕНИЕ: Добавляем кнопку "💬 Все диалоги" для СУПЕРАДМИНА и ОЛЬГИ
+    if user_id == YOUR_ADMIN_ID:
+        kb.add(InlineKeyboardButton("👁️ ВСЕ диалоги (Суперадмин)", callback_data="admin_view_conversations"))
+    elif user_id == OLGA_ID:
+        kb.add(InlineKeyboardButton("💬 Диалоги наставников", callback_data="admin_view_conversations"))
     
     # Проверяем, зарегистрирован ли пользователь
     data = load_users()
