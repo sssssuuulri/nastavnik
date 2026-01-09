@@ -375,7 +375,8 @@ async def set_bot_commands():
         types.BotCommand("stats", "📊 Статистика"),
         types.BotCommand("broadcast", "📢 Рассылка"),
         types.BotCommand("check_data", "🔧 Проверить данные"),
-        types.BotCommand("fix_data", "🛠 Исправить данные")
+        types.BotCommand("fix_data", "🛠 Исправить данные"),
+        types.BotCommand("register_superadmin", "👑 Зарегистрировать суперадмина")
     ]
     
     await bot.set_my_commands(commands)
@@ -411,19 +412,34 @@ async def admin_main_menu(user_id):
     kb = InlineKeyboardMarkup(row_width=1)
     
     kb.add(InlineKeyboardButton("👑 Админ-панель", callback_data="admin_panel"))
-    kb.add(InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"))
-    kb.add(InlineKeyboardButton("👥 Мои ученики", callback_data="show_my_students"))
+    
+    # Проверяем, зарегистрирован ли пользователь
+    data = load_users()
+    users = data["users"]
+    
+    if str(user_id) in users:
+        kb.add(InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"))
+        kb.add(InlineKeyboardButton("👥 Мои ученики", callback_data="show_my_students"))
+    else:
+        # Для не-зарегистрированного суперадмина
+        kb.add(InlineKeyboardButton("👤 Зарегистрироваться", callback_data="register_as_admin"))
+    
     kb.add(InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
-    kb.add(InlineKeyboardButton("💬 Все диалоги", callback_data="admin_view_conversations"))
+    kb.add(InlineKeyboardButton("💬 Все диалоги", callback_data="admin_view_conversations"))  # ВСЕГДА показываем эту кнопку
     
     if user_id == YOUR_ADMIN_ID:
         kb.add(InlineKeyboardButton("🌐 Все пользователи", callback_data="all_users"))
         kb.add(InlineKeyboardButton("🗺 Полная иерархия", callback_data="full_hierarchy"))
     
+    # Разный текст в зависимости от регистрации
+    if str(user_id) in users:
+        welcome_text = "🛠 <b>Панель администратора</b>\n\nДоступны все функции управления ботом."
+    else:
+        welcome_text = f"👑 <b>Панель СУПЕРАДМИНА</b>\n\nВы не зарегистрированы как пользователь, но имеете полный доступ ко всем функциям бота.\n\nВаш ID: <code>{user_id}</code>"
+    
     await bot.send_message(
         user_id,
-        "🛠 <b>Панель администратора</b>\n\n"
-        "Доступны все функции управления ботом.",
+        welcome_text,
         reply_markup=kb
     )
 
@@ -466,6 +482,8 @@ async def admin_panel_handler(callback):
 async def back_to_admin_main(callback):
     if callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]:
         await admin_main_menu(callback.from_user.id)
+    else:
+        await callback.answer("Доступ запрещён", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_stats")
 async def admin_stats(callback):
@@ -601,6 +619,10 @@ async def admin_view_conversations_handler(callback: types.CallbackQuery):
 
 async def superadmin_view_all_conversations(callback: types.CallbackQuery, conversations, users_data):
     """Суперадмин видит ВСЕ диалоги"""
+    if callback.from_user.id != YOUR_ADMIN_ID:
+        await callback.answer("Доступ только для суперадмина", show_alert=True)
+        return
+    
     # Группируем диалоги по парам пользователей
     conversation_pairs = {}
     
@@ -688,7 +710,7 @@ async def superadmin_view_all_conversations(callback: types.CallbackQuery, conve
         ))
     
     kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="admin_view_conversations"))
-    kb.add(InlineKeyboardButton("⬅ Назад", callback_data="admin_panel"))
+    kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_to_admin_main"))
     
     await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
@@ -791,7 +813,7 @@ async def admin_view_mentor_conversations(callback: types.CallbackQuery, convers
         ))
     
     kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="admin_view_conversations"))
-    kb.add(InlineKeyboardButton("⬅ Назад", callback_data="admin_panel"))
+    kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_to_admin_main"))
     
     await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
@@ -898,7 +920,7 @@ async def admin_view_mentor_conversations_only_handler(callback: types.CallbackQ
         ))
     
     kb.add(InlineKeyboardButton("🔙 К всем диалогам", callback_data="admin_view_conversations"))
-    kb.add(InlineKeyboardButton("⬅ Назад", callback_data="admin_panel"))
+    kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_to_admin_main"))
     
     await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
@@ -1116,6 +1138,71 @@ async def fix_data_command(message: types.Message, state=None):
     else:
         await message.answer("❌ Не удалось исправить данные")
 
+# --- РЕГИСТРАЦИЯ СУПЕРАДМИНА ---
+@dp.callback_query_handler(lambda c: c.data == "register_as_admin")
+async def register_admin(callback: types.CallbackQuery):
+    """Регистрация суперадмина как пользователя"""
+    if callback.from_user.id != YOUR_ADMIN_ID:
+        await callback.answer("Доступ только для суперадмина", show_alert=True)
+        return
+    
+    user_id = str(callback.from_user.id)
+    data = load_users()
+    users = data["users"]
+    
+    if user_id in users:
+        await callback.answer("Вы уже зарегистрированы", show_alert=True)
+        return
+    
+    # Регистрируем суперадмина с максимальными правами
+    users[user_id] = {
+        "name": "Суперадмин",
+        "surname": "",
+        "level": "ГТ",  # Высший уровень
+        "chat_id": user_id,
+        "registration_date": str(date.today()),
+        "active_today": str(date.today()),
+        "is_superadmin": True  # Флаг суперадмина
+    }
+    
+    if save_users(data):
+        await callback.answer("✅ Вы зарегистрированы как Суперадмин", show_alert=True)
+        await admin_main_menu(callback.from_user.id)
+    else:
+        await callback.answer("❌ Ошибка регистрации", show_alert=True)
+
+@dp.message_handler(commands=["register_superadmin"], state="*")
+async def register_superadmin_command(message: types.Message, state=None):
+    """Принудительная регистрация суперадмина"""
+    if message.from_user.id != YOUR_ADMIN_ID:
+        await message.answer("⚠️ Команда только для суперадмина")
+        return
+    
+    user_id = str(message.from_user.id)
+    data = load_users()
+    users = data["users"]
+    
+    if user_id in users:
+        await message.answer("✅ Вы уже зарегистрированы как Суперадмин")
+        return
+    
+    # Регистрируем суперадмина
+    users[user_id] = {
+        "name": "Суперадмин",
+        "surname": "",
+        "level": "ГТ",
+        "chat_id": user_id,
+        "registration_date": str(date.today()),
+        "active_today": str(date.today()),
+        "is_superadmin": True
+    }
+    
+    if save_users(data):
+        await message.answer("✅ Вы успешно зарегистрированы как Суперадмин!")
+        await admin_main_menu(message.from_user.id)
+    else:
+        await message.answer("❌ Ошибка регистрации")
+
 # --- BUTTON: ОБЫЧНОЕ МЕНЮ НАСТАВНИКА ---
 async def mentor_main_menu(user_id):
     data = load_users()
@@ -1173,7 +1260,7 @@ async def help_command(message: types.Message, state=None):
 • Просматривать решения заданий от своих учеников
 
 <b>Для администраторов:</b>
-• Доступны дополнительные команды (/admin, /stats, /broadcast, /check_data, /fix_data)
+• Доступны дополнительные команды (/admin, /stats, /broadcast, /check_data, /fix_data, /register_superadmin)
 • Управление статистикой и рассылками
 • Проверка и исправление данных
 • Отправка заданий ученикам через рассылку
@@ -1196,6 +1283,7 @@ async def menu_command(message: types.Message, state=None):
         users[str(user_id)]["active_today"] = today_str
         save_users(data)
     
+    # СУПЕРАДМИН всегда получает админ-меню
     if user_id in [OLGA_ID, YOUR_ADMIN_ID]:
         await admin_main_menu(user_id)
     else:
@@ -1309,6 +1397,7 @@ async def admin_command(message: types.Message, state=None):
         await message.answer("⚠️ Эта команда доступна только администраторам")
         return
     
+    # СУПЕРАДМИН всегда получает админ-меню
     await admin_main_menu(message.from_user.id)
 
 @dp.message_handler(commands=["stats"], state="*")
@@ -1393,6 +1482,13 @@ async def start(message: types.Message, state=None):
 
     if user_id in [OLGA_ID, YOUR_ADMIN_ID]:
         await message.answer(f"Привет, администратор! 👑")
+        
+        # Для суперадмина - всегда показываем админ-меню, даже если не зарегистрирован
+        if user_id == YOUR_ADMIN_ID and str(user_id) not in users:
+            await message.answer(f"⚠️ <b>Вы не зарегистрированы как пользователь</b>\n\n"
+                               f"Вы можете использовать все административные функции, "
+                               f"но для работы с профилем рекомендуется зарегистрироваться.")
+        
         await admin_main_menu(user_id)
         return
 
@@ -2043,6 +2139,8 @@ async def my_students(callback):
 @dp.callback_query_handler(lambda c: c.data == "back_main")
 async def back_main(callback):
     user_id = callback.from_user.id
+    
+    # СУПЕРАДМИН всегда получает админ-меню
     if user_id in [OLGA_ID, YOUR_ADMIN_ID]:
         await admin_main_menu(user_id)
     else:
@@ -3348,12 +3446,13 @@ if __name__ == "__main__":
     print("="*50)
     print("🚀 Бот запущен и готов к работе!")
     print("🛡️  Данные защищены от потери")
-    print("🔧 Новые команды для админа: /check_data, /fix_data")
+    print("🔧 Новые команды для админа: /check_data, /fix_data, /register_superadmin")
     print("📊 Добавлены функции смены наставника и уровня")
     print("📚 Добавлена система заданий: Ольга/Суперадмин → ученики → наставники")
     print("💬 ДОБАВЛЕНА СИСТЕМА ПРОСМОТРА ВСЕХ ДИАЛОГОВ:")
-    print("   • 👁️ Суперадмин: видит ВСЕ диалоги в системе")
+    print("   • 👁️ Суперадмин: видит ВСЕ диалоги в системе (даже без регистрации)")
     print("   • 💬 Ольга: видит только диалоги наставников с учениками")
+    print("   • Суперадмин ВСЕГДА видит кнопку 'Все диалоги'")
     print("   • Диалоги автоматически сохраняются при общении через бота")
     print("🔄 Защита от длинных сообщений добавлена")
     print("="*50)
