@@ -9,10 +9,9 @@ from aiogram.utils import executor
 from dotenv import load_dotenv
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import shutil
 import hashlib
-from typing import Dict, List, Optional
 
 # --- ЛОГИ ---
 logger = logging.getLogger("bot_logger")
@@ -49,23 +48,10 @@ dp = Dispatcher(bot, storage=storage)
 
 USERS_FILE = "users.json"
 ASSIGNMENTS_FILE = "assignments.json"  # НОВЫЙ ФАЙЛ ДЛЯ ЗАДАНИЙ
-BROADCAST_HISTORY_FILE = "broadcast_history.json"  # НОВЫЙ ФАЙЛ ДЛЯ ИСТОРИИ РАССЫЛОК
 LEVELS_ORDER = ["НП", "СВ", "ВТ", "АВТ", "ГТ"]
 OLGA_ID = 64434196
 YOUR_ADMIN_ID = 911511438
 REPORT_GROUP_ID = "-1003632130674"
-
-# НОВЫЕ КОНСТАНТЫ ДЛЯ ТИПОВ ОШИБОК РАССЫЛКИ
-BROADCAST_ERROR_TYPES = {
-    "user_blocked": "Пользователь заблокировал бота",
-    "chat_not_found": "Чат не найден/удален",
-    "bot_blocked": "Бот заблокирован пользователем",
-    "user_deactivated": "Пользователь деактивирован",
-    "peer_id_invalid": "Неверный ID пользователя",
-    "message_too_long": "Сообщение слишком длинное",
-    "network_error": "Ошибка сети",
-    "unknown": "Неизвестная ошибка"
-}
 
 # --- Функция для разбивки длинных сообщений на части ---
 async def safe_send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
@@ -110,381 +96,6 @@ async def safe_send_message(chat_id, text, reply_markup=None, parse_mode="HTML")
         # Уведомляем, если сообщение было разбито
         if len(parts) > 1:
             await bot.send_message(chat_id, f"📄 *Сообщение разбито на {len(parts)} части*", parse_mode="Markdown")
-
-# --- НОВЫЕ ФУНКЦИИ ДЛЯ УЛУЧШЕННОЙ РАССЫЛКИ ---
-
-def classify_error(error_message: str) -> str:
-    """Определяет тип ошибки рассылки по тексту ошибки"""
-    error_msg = str(error_message).lower()
-    
-    if "blocked" in error_msg or "bot was blocked" in error_msg:
-        return "user_blocked"
-    elif "chat not found" in error_msg or "chat not found" in error_msg:
-        return "chat_not_found"
-    elif "bot blocked" in error_msg:
-        return "bot_blocked"
-    elif "user is deactivated" in error_msg or "deactivated" in error_msg:
-        return "user_deactivated"
-    elif "peer id invalid" in error_msg:
-        return "peer_id_invalid"
-    elif "message is too long" in error_msg:
-        return "message_too_long"
-    elif "network" in error_msg or "connection" in error_msg:
-        return "network_error"
-    else:
-        return "unknown"
-
-def load_broadcast_history() -> dict:
-    """Загрузка истории рассылок"""
-    if not os.path.exists(BROADCAST_HISTORY_FILE):
-        return {
-            "broadcasts": {},
-            "failed_deliveries": {},
-            "stats": {
-                "total_broadcasts": 0,
-                "total_sent": 0,
-                "total_failed": 0
-            }
-        }
-    
-    try:
-        with open(BROADCAST_HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log_error(f"❌ Ошибка загрузки истории рассылок: {e}")
-        return {
-            "broadcasts": {},
-            "failed_deliveries": {},
-            "stats": {
-                "total_broadcasts": 0,
-                "total_sent": 0,
-                "total_failed": 0
-            }
-        }
-
-def save_broadcast_history(data: dict) -> bool:
-    """Сохранение истории рассылок"""
-    try:
-        with open(BROADCAST_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as e:
-        log_error(f"❌ Ошибка сохранения истории рассылок: {e}")
-        return False
-
-def add_broadcast_to_history(
-    broadcast_id: str,
-    admin_id: str,
-    target: str,
-    recipients_count: int,
-    sent_count: int,
-    failed_count: int,
-    message_type: str,
-    timestamp: str
-) -> None:
-    """Добавление рассылки в историю"""
-    history = load_broadcast_history()
-    
-    history["broadcasts"][broadcast_id] = {
-        "admin_id": admin_id,
-        "target": target,
-        "recipients_count": recipients_count,
-        "sent_count": sent_count,
-        "failed_count": failed_count,
-        "message_type": message_type,
-        "timestamp": timestamp,
-        "failed_users": []
-    }
-    
-    # Обновляем статистику
-    history["stats"]["total_broadcasts"] += 1
-    history["stats"]["total_sent"] += sent_count
-    history["stats"]["total_failed"] += failed_count
-    
-    save_broadcast_history(history)
-
-def add_failed_delivery(
-    broadcast_id: str,
-    user_id: str,
-    user_name: str,
-    error_type: str,
-    error_message: str,
-    timestamp: str
-) -> None:
-    """Добавление информации о неудачной доставке"""
-    history = load_broadcast_history()
-    
-    if broadcast_id not in history["failed_deliveries"]:
-        history["failed_deliveries"][broadcast_id] = []
-    
-    failed_delivery = {
-        "user_id": user_id,
-        "user_name": user_name,
-        "error_type": error_type,
-        "error_message": error_message,
-        "timestamp": timestamp
-    }
-    
-    history["failed_deliveries"][broadcast_id].append(failed_delivery)
-    
-    # Также добавляем в информацию о рассылке
-    if broadcast_id in history["broadcasts"]:
-        history["broadcasts"][broadcast_id]["failed_users"].append({
-            "user_id": user_id,
-            "user_name": user_name,
-            "error_type": error_type
-        })
-    
-    save_broadcast_history(history)
-
-def get_failed_deliveries_by_broadcast(broadcast_id: str) -> List[dict]:
-    """Получение списка неудачных доставок по ID рассылки"""
-    history = load_broadcast_history()
-    return history.get("failed_deliveries", {}).get(broadcast_id, [])
-
-def get_broadcast_stats(broadcast_id: str) -> Optional[dict]:
-    """Получение статистики по рассылке"""
-    history = load_broadcast_history()
-    return history.get("broadcasts", {}).get(broadcast_id)
-
-def group_errors_by_type(failed_deliveries: List[dict]) -> Dict[str, List[dict]]:
-    """Группировка ошибок по типам"""
-    grouped = {}
-    for delivery in failed_deliveries:
-        error_type = delivery.get("error_type", "unknown")
-        if error_type not in grouped:
-            grouped[error_type] = []
-        grouped[error_type].append(delivery)
-    return grouped
-
-def cleanup_old_data(days_to_keep: int = 7) -> int:
-    """Автоматическая очистка старых данных"""
-    try:
-        # Очистка истории рассылок старше days_to_keep дней
-        history = load_broadcast_history()
-        current_time = datetime.now()
-        cutoff_date = current_time - timedelta(days=days_to_keep)
-        
-        broadcasts_to_remove = []
-        for broadcast_id, broadcast_data in history.get("broadcasts", {}).items():
-            try:
-                broadcast_time = datetime.fromisoformat(broadcast_data.get("timestamp", "").replace('Z', '+00:00'))
-                if broadcast_time < cutoff_date:
-                    broadcasts_to_remove.append(broadcast_id)
-            except:
-                pass
-        
-        # Удаляем старые рассылки
-        for broadcast_id in broadcasts_to_remove:
-            history["broadcasts"].pop(broadcast_id, None)
-            history["failed_deliveries"].pop(broadcast_id, None)
-        
-        # Очистка старых backup файлов
-        backup_files = [f for f in os.listdir('.') if f.startswith('users_backup_')]
-        for backup_file in backup_files:
-            try:
-                # Пытаемся извлечь дату из имени файла
-                date_str = backup_file.replace('users_backup_', '').replace('.json', '')
-                backup_date = datetime.strptime(date_str[:15], '%Y%m%d_%H%M%S')
-                if backup_date < cutoff_date:
-                    os.remove(backup_file)
-                    log_info(f"🗑️ Удален старый backup: {backup_file}")
-            except:
-                pass
-        
-        # Очистка поврежденных файлов старше 3 дней
-        corrupted_files = [f for f in os.listdir('.') if f.startswith('users_corrupted_')]
-        for corrupted_file in corrupted_files:
-            try:
-                date_str = corrupted_file.replace('users_corrupted_', '').replace('.json', '')
-                corrupted_date = datetime.strptime(date_str[:15], '%Y%m%d_%H%M%S')
-                if corrupted_date < cutoff_date - timedelta(days=3):
-                    os.remove(corrupted_file)
-                    log_info(f"🗑️ Удален старый поврежденный файл: {corrupted_file}")
-            except:
-                pass
-        
-        save_broadcast_history(history)
-        log_info(f"🧹 Очищены данные старше {days_to_keep} дней")
-        return len(broadcasts_to_remove)
-        
-    except Exception as e:
-        log_error(f"❌ Ошибка при очистке данных: {e}")
-        return 0
-
-# НОВЫЕ АСИНХРОННЫЕ ФУНКЦИИ ДЛЯ УВЕДОМЛЕНИЙ
-
-async def send_admin_notification(admin_id: int, title: str, message: str, 
-                                 broadcast_id: str = None, is_error: bool = False):
-    """Отправка улучшенного уведомления администратору"""
-    try:
-        emoji = "⚠️" if is_error else "📢"
-        text = f"{emoji} <b>{title}</b>\n\n{message}"
-        
-        if broadcast_id:
-            text += f"\n\n🔍 ID рассылки: <code>{broadcast_id}</code>"
-        
-        kb = None
-        if broadcast_id:
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                InlineKeyboardButton("📊 Статус рассылки", callback_data=f"broadcast_status:{broadcast_id}"),
-                InlineKeyboardButton("📋 Список ошибок", callback_data=f"failed_list:{broadcast_id}:1")
-            )
-        
-        await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
-        
-    except Exception as e:
-        log_error(f"Ошибка отправки уведомления администратору: {e}")
-
-async def send_broadcast_progress_update(admin_id: int, broadcast_id: str, 
-                                        current: int, total: int, sent: int, failed: int):
-    """Отправка обновления о ходе рассылки"""
-    if current % 10 == 0 or current == total:
-        progress_percent = (current / total) * 100
-        progress_bar = "█" * int(progress_percent / 10) + "░" * (10 - int(progress_percent / 10))
-        
-        text = (
-            f"📊 <b>Ход рассылки</b>\n\n"
-            f"🔹 Прогресс: {current}/{total}\n"
-            f"🔹 {progress_bar} {progress_percent:.1f}%\n\n"
-            f"✅ Отправлено: {sent}\n"
-            f"❌ Ошибок: {failed}"
-        )
-        
-        try:
-            await bot.send_message(admin_id, text, parse_mode="HTML")
-        except:
-            pass
-
-async def send_broadcast_summary(admin_id: int, broadcast_id: str, 
-                                total: int, sent: int, failed: int, 
-                                target: str, failed_deliveries: List[dict]):
-    """Отправка сводки по завершении рассылки"""
-    success_rate = (sent / total * 100) if total > 0 else 0
-    
-    # Группируем ошибки по типам
-    error_groups = group_errors_by_type(failed_deliveries)
-    
-    text = f"📊 <b>СВОДКА ПО РАССЫЛКЕ</b>\n\n"
-    text += f"🔹 Целевая аудитория: {target}\n"
-    text += f"🔹 Всего получателей: {total}\n"
-    text += f"🔹 Успешно отправлено: {sent} ({success_rate:.1f}%)\n"
-    text += f"🔹 Не отправлено: {failed}\n\n"
-    
-    if error_groups:
-        text += f"<b>Группировка ошибок:</b>\n"
-        for error_type, errors in error_groups.items():
-            error_name = BROADCAST_ERROR_TYPES.get(error_type, "Неизвестная ошибка")
-            text += f"• {error_name}: {len(errors)} ошибок\n"
-    
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("📋 Детальный отчет", callback_data=f"broadcast_report:{broadcast_id}"),
-        InlineKeyboardButton("❌ Список ошибок", callback_data=f"failed_list:{broadcast_id}:1")
-    )
-    if failed > 0:
-        kb.add(InlineKeyboardButton("🔄 Повторить ошибки", callback_data=f"retry_failed:{broadcast_id}"))
-    
-    await send_admin_notification(admin_id, "Рассылка завершена", text, broadcast_id)
-
-async def enhanced_broadcast(
-    admin_id: int,
-    message: types.Message,
-    recipients: List[str],
-    target_description: str,
-    broadcast_type: str = "regular"
-) -> str:
-    """Улучшенная функция рассылки с отслеживанием ошибок"""
-    broadcast_id = f"broadcast_{admin_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    # Уведомляем о начале рассылки
-    await send_admin_notification(
-        admin_id,
-        "Начинаю рассылку",
-        f"🔹 Тип: {'Задание' if broadcast_type == 'assignment' else 'Обычная рассылка'}\n"
-        f"🔹 Получателей: {len(recipients)}\n"
-        f"🔹 Целевая аудитория: {target_description}",
-        broadcast_id
-    )
-    
-    sent_count = 0
-    failed_count = 0
-    failed_deliveries = []
-    
-    users_data = load_users()["users"]
-    
-    # Отправляем сообщения
-    for i, user_id in enumerate(recipients, 1):
-        try:
-            user_name = "Неизвестный"
-            if user_id in users_data:
-                user = users_data[user_id]
-                user_name = f"{user['name']} {user.get('surname', '')}".strip()
-            
-            # Отправляем сообщение в зависимости от типа
-            if message.content_type == "text":
-                await bot.send_message(user_id, message.text)
-            elif message.content_type == "photo":
-                await bot.send_photo(user_id, message.photo[-1].file_id, caption=message.caption)
-            elif message.content_type == "video":
-                await bot.send_video(user_id, message.video.file_id, caption=message.caption)
-            elif message.content_type == "document":
-                await bot.send_document(user_id, message.document.file_id, caption=message.caption)
-            elif message.content_type == "voice":
-                await bot.send_voice(user_id, message.voice.file_id)
-            
-            sent_count += 1
-            
-            # Периодически отправляем обновление о прогрессе
-            if i % 10 == 0:
-                await send_broadcast_progress_update(
-                    admin_id, broadcast_id, i, len(recipients), sent_count, failed_count
-                )
-            
-            await asyncio.sleep(0.1)
-            
-        except Exception as e:
-            failed_count += 1
-            error_type = classify_error(str(e))
-            error_message = str(e)
-            
-            # Добавляем информацию о неудачной доставке
-            failed_delivery = {
-                "user_id": user_id,
-                "user_name": user_name,
-                "error_type": error_type,
-                "error_message": error_message,
-                "timestamp": str(datetime.now())
-            }
-            failed_deliveries.append(failed_delivery)
-            
-            # Сохраняем в историю
-            add_failed_delivery(
-                broadcast_id, user_id, user_name, error_type, error_message, str(datetime.now())
-            )
-            
-            log_error(f"Ошибка отправки {user_id} ({user_name}): {error_type} - {error_message}")
-    
-    # Сохраняем информацию о рассылке
-    add_broadcast_to_history(
-        broadcast_id=broadcast_id,
-        admin_id=str(admin_id),
-        target=target_description,
-        recipients_count=len(recipients),
-        sent_count=sent_count,
-        failed_count=failed_count,
-        message_type=message.content_type,
-        timestamp=str(datetime.now())
-    )
-    
-    # Отправляем итоговую сводку
-    await send_broadcast_summary(
-        admin_id, broadcast_id, len(recipients), sent_count, failed_count, 
-        target_description, failed_deliveries
-    )
-    
-    return broadcast_id
 
 # --- УЛУЧШЕННАЯ БЕЗОПАСНАЯ ЗАГРУЗКА И СОХРАНЕНИЕ ---
 def recover_corrupted_file():
@@ -666,14 +277,14 @@ def save_users(data):
 def load_assignments():
     """Загрузка заданий и решений"""
     if not os.path.exists(ASSIGNMENTS_FILE):
-        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}, "active_dialogues": {}}
+        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
     
     try:
         with open(ASSIGNMENTS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
         log_error(f"❌ Ошибка загрузки assignments.json: {e}")
-        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}, "active_dialogues": {}}
+        return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
 
 def save_assignments(data):
     """Сохранение заданий"""
@@ -685,83 +296,69 @@ def save_assignments(data):
         log_error(f"❌ Ошибка сохранения assignments.json: {e}")
         return False
 
-# --- НОВЫЕ ФУНКЦИИ ДЛЯ УПРАВЛЕНИЯ ДИАЛОГАМИ ---
-def save_dialogue_state(mentor_id: str, student_id: str, assignment_id: str = None):
-    """Сохранение состояния активного диалога"""
+# --- ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ СОХРАНЕНИЯ ПЕРЕПИСКИ ---
+def save_conversation_message(from_id, to_id, message, assignment_id=None, is_assignment_related=False):
+    """Сохранение сообщения в историю переписки"""
     assignments_data = load_assignments()
     
-    # Сохраняем диалог для наставника
-    assignments_data.setdefault("active_dialogues", {})[mentor_id] = {
-        "with_student": student_id,
-        "assignment_id": assignment_id,
-        "started_at": str(datetime.now())
-    }
+    message_id = f"msg_{from_id}_{to_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    # Сохраняем диалог для ученика
-    assignments_data.setdefault("active_dialogues", {})[student_id] = {
-        "with_mentor": mentor_id,
-        "assignment_id": assignment_id,
-        "started_at": str(datetime.now())
-    }
+    users_data = load_users()["users"]
+    from_user = users_data.get(from_id, {})
+    to_user = users_data.get(to_id, {})
     
-    return save_assignments(assignments_data)
-
-def end_dialogue(user_id: str):
-    """Завершение диалога для пользователя"""
-    assignments_data = load_assignments()
+    from_name = f"{from_user.get('name', '?')} {from_user.get('surname', '')}".strip()
+    to_name = f"{to_user.get('name', '?')} {to_user.get('surname', '')}".strip()
     
-    if user_id in assignments_data.get("active_dialogues", {}):
-        # Находим собеседника
-        dialogue_info = assignments_data["active_dialogues"][user_id]
-        partner_id = dialogue_info.get("with_student") or dialogue_info.get("with_mentor")
-        
-        # Удаляем диалог для обоих участников
-        assignments_data["active_dialogues"].pop(user_id, None)
-        if partner_id:
-            assignments_data["active_dialogues"].pop(partner_id, None)
-        
-        save_assignments(assignments_data)
-        return partner_id
-    
-    return None
-
-def get_active_dialogue(user_id: str):
-    """Получение информации об активном диалоге"""
-    assignments_data = load_assignments()
-    return assignments_data.get("active_dialogues", {}).get(user_id)
-
-def save_dialogue_message(sender_id: str, receiver_id: str, message_data: dict):
-    """Сохранение сообщения в истории диалога"""
-    assignments_data = load_assignments()
-    
-    dialogue_id = f"{min(sender_id, receiver_id)}_{max(sender_id, receiver_id)}"
-    
-    if dialogue_id not in assignments_data.get("conversations", {}):
-        assignments_data["conversations"][dialogue_id] = {
-            "participants": [sender_id, receiver_id],
-            "messages": []
-        }
-    
-    message_record = {
-        "sender_id": sender_id,
-        "receiver_id": receiver_id,
+    message_data = {
+        "message_id": message_id,
+        "from_user_id": from_id,
+        "from_user_name": from_name,
+        "to_user_id": to_id,
+        "to_user_name": to_name,
         "timestamp": str(datetime.now()),
-        "content_type": message_data.get("content_type"),
-        "text": message_data.get("text"),
-        "photo_id": message_data.get("photo_id"),
-        "document_id": message_data.get("document_id"),
-        "voice_id": message_data.get("voice_id"),
-        "caption": message_data.get("caption")
+        "content_type": message.content_type,
+        "assignment_id": assignment_id,
+        "is_assignment_related": is_assignment_related
     }
     
-    assignments_data["conversations"][dialogue_id]["messages"].append(message_record)
+    # Сохраняем содержимое в зависимости от типа
+    if message.content_type == "text":
+        message_data["text"] = message.text
+    elif message.content_type == "photo":
+        message_data["photo_id"] = message.photo[-1].file_id
+        message_data["caption"] = message.caption
+    elif message.content_type == "document":
+        message_data["document_id"] = message.document.file_id
+        message_data["caption"] = message.caption
+    elif message.content_type == "voice":
+        message_data["voice_id"] = message.voice.file_id
+    elif message.content_type == "video":
+        message_data["video_id"] = message.video.file_id
+        message_data["caption"] = message.caption
     
-    # Ограничиваем историю последними 100 сообщениями
-    if len(assignments_data["conversations"][dialogue_id]["messages"]) > 100:
-        assignments_data["conversations"][dialogue_id]["messages"] = \
-            assignments_data["conversations"][dialogue_id]["messages"][-100:]
+    assignments_data.setdefault("conversations", {})[message_id] = message_data
     
+    # Сохраняем обновленные данные
     return save_assignments(assignments_data)
+
+def get_conversation_history(user1_id, user2_id, limit=50):
+    """Получение истории переписки между двумя пользователями"""
+    assignments_data = load_assignments()
+    conversations = assignments_data.get("conversations", {})
+    
+    # Фильтруем сообщения между этими пользователями
+    history = []
+    for msg_id, msg in conversations.items():
+        if (msg["from_user_id"] == user1_id and msg["to_user_id"] == user2_id) or \
+           (msg["from_user_id"] == user2_id and msg["to_user_id"] == user1_id):
+            history.append(msg)
+    
+    # Сортируем по времени (старые сначала)
+    history.sort(key=lambda x: x.get("timestamp", ""))
+    
+    # Возвращаем последние N сообщений
+    return history[-limit:] if limit > 0 else history
 
 # --- МЕНЮ КОМАНД ---
 async def set_bot_commands():
@@ -809,10 +406,9 @@ class AssignmentStates(StatesGroup):
     waiting_for_solution = State()  # Ученик отправляет решение
     mentor_reply = State()          # Наставник отвечает ученику
 
-# НОВЫЕ СОСТОЯНИЯ ДЛЯ ДИАЛОГОВ
-class DialogueStates(StatesGroup):
-    in_dialogue_with_mentor = State()    # Ученик в диалоге с наставником
-    in_dialogue_with_student = State()   # Наставник в диалоге с учеником
+# НОВЫЕ СОСТОЯНИЯ ДЛЯ ЛИЧНОЙ ПЕРЕПИСКИ
+class ConversationStates(StatesGroup):
+    waiting_for_private_message = State()  # Ожидание личного сообщения
 
 # --- АДМИН МЕНЮ ---
 async def admin_main_menu(user_id):
@@ -1091,18 +687,14 @@ async def help_command(message: types.Message, state=None):
 • Изменять свой уровень (требуется подтверждение наставника)
 • Изменять наставника (требуется подтверждение нового наставника)
 • Просматривать решения заданий от своих учеников
-• Общаться с учениками в режиме диалога
-
-<b>Для учеников:</b>
-• Вы можете отправлять решения заданий наставнику
-• Общаться с наставником в режиме диалога
-• Менять уровень и наставника (с подтверждением)
+• 💬 Общаться с учениками в личных сообщениях (вся переписка сохраняется)
 
 <b>Для администраторов:</b>
 • Доступны дополнительные команды (/admin, /stats, /broadcast, /check_data, /fix_data)
 • Управление статистикой и рассылками
 • Проверка и исправление данных
 • Отправка заданий ученикам через рассылку
+• 👁️ Просмотр переписок всех наставников с учениками
     """
     await message.answer(help_text)
 
@@ -1481,156 +1073,48 @@ async def choose_mentor(callback, state):
 
     await callback.message.answer(f"Вы выбрали наставника <b>{mentor_name}</b>. Ждём подтверждения.")
 
-# --- ПОДТВЕРЖДЕНИЕ НАСТАВНИКОМ ---
+# --- Подтверждение наставником ---
 @dp.callback_query_handler(lambda c: c.data.startswith("mentor_accept:"))
 async def mentor_accept(callback):
-    """ИСПРАВЛЕННЫЙ обработчик принятия наставника"""
-    try:
-        callback_data = callback.data
-        
-        # Проверяем, что callback_data существует и имеет правильный формат
-        if not callback_data or ':' not in callback_data:
-            await callback.answer("Ошибка: некорректные данные", show_alert=True)
-            return
-            
-        # Разбираем callback_data - формат: "mentor_accept:user_id"
-        parts = callback_data.split(':')
-        
-        # Проверяем, что есть все необходимые части
-        if len(parts) < 2:
-            await callback.answer("Ошибка: недостаточно данных", show_alert=True)
-            return
-            
-        # Получаем user_id (вторая часть после разделения)
-        user_id_str = parts[1]
-        
-        # Проверяем, что user_id_str не пустой и состоит из цифр
-        if not user_id_str or not user_id_str.isdigit():
-            await callback.answer("Ошибка: неверный ID пользователя", show_alert=True)
-            return
-            
-        # Преобразуем в str только после всех проверок
-        chosen_user_id = user_id_str
-        
-        data = load_users()
-        users = data["users"]
-        
-        # Проверяем, что пользователь существует
-        if chosen_user_id not in users:
-            await callback.answer("Ошибка: пользователь не найден", show_alert=True)
-            return
-        
-        # Получаем mentor_id из данных пользователя
-        mentor_id = users[chosen_user_id].get("pending_mentor")
-        if not mentor_id:
-            await callback.answer("Ошибка: не найден запрос на наставничество", show_alert=True)
-            return
-        
-        # Проверяем, что текущий пользователь действительно является ожидаемым наставником
-        if str(callback.from_user.id) != mentor_id:
-            await callback.answer("Ошибка: вы не являетесь ожидаемым наставником", show_alert=True)
-            return
-        
-        # Принимаем наставника
-        users[chosen_user_id]["mentor"] = mentor_id
-        users[chosen_user_id].pop("pending_mentor", None)
-        
-        if not save_users(data):
-            await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
-            return
+    chosen_user_id = callback.data.split(":")[1]
 
-        await callback.message.edit_text(
-            f"Вы приняли ученика <b>{users[chosen_user_id]['name']} {users[chosen_user_id].get('surname','')}</b>"
-        )
+    data = load_users()
+    users = data["users"]
+
+    mentor_id = users[chosen_user_id].get("pending_mentor")
+    users[chosen_user_id]["mentor"] = mentor_id
+    users[chosen_user_id].pop("pending_mentor", None)
+    
+    if not save_users(data):
+        await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"Вы приняли ученика <b>{users[chosen_user_id]['name']} {users[chosen_user_id].get('surname','')}</b>"
+    )
+    
+    # Для Ольги - показываем админ-меню, для остальных - обычное меню наставника
+    if mentor_id == str(OLGA_ID) or mentor_id == str(YOUR_ADMIN_ID):
+        await admin_main_menu(int(mentor_id))
+    else:
+        await mentor_main_menu(int(mentor_id))
         
-        # Получаем ID наставника как число для передачи в mentor_main_menu
-        try:
-            mentor_id_int = int(mentor_id)
-        except ValueError:
-            mentor_id_int = callback.from_user.id
-        
-        # Для Ольги - показываем админ-меню, для остальных - обычное меню наставника
-        if mentor_id_int == OLGA_ID or mentor_id_int == YOUR_ADMIN_ID:
-            await admin_main_menu(mentor_id_int)
-        else:
-            await mentor_main_menu(mentor_id_int)
-            
-        await bot.send_message(chosen_user_id, "Наставник подтвердил ваш выбор ✅")
-        
-    except Exception as e:
-        # Логируем ошибку для отладки
-        log_error(f"Ошибка в mentor_accept: {e}")
-        log_error(f"Callback data: {callback.data if callback else 'No callback'}")
-        
-        # Уведомляем пользователя об ошибке
-        await callback.answer("Произошла ошибка при обработке запроса", show_alert=True)
+    await bot.send_message(chosen_user_id, "Наставник подтвердил ваш выбор ✅")
 
 @dp.callback_query_handler(lambda c: c.data.startswith("mentor_decline:"))
 async def mentor_decline(callback):
-    """ИСПРАВЛЕННЫЙ обработчик отклонения наставника"""
-    try:
-        callback_data = callback.data
-        
-        # Проверяем, что callback_data существует и имеет правильный формат
-        if not callback_data or ':' not in callback_data:
-            await callback.answer("Ошибка: некорректные данные", show_alert=True)
-            return
-            
-        # Разбираем callback_data - формат: "mentor_decline:user_id"
-        parts = callback.data.split(':')
-        
-        # Проверяем, что есть все необходимые части
-        if len(parts) < 2:
-            await callback.answer("Ошибка: недостаточно данных", show_alert=True)
-            return
-            
-        # Получаем user_id (вторая часть после разделения)
-        user_id_str = parts[1]
-        
-        # Проверяем, что user_id_str не пустой и состоит из цифр
-        if not user_id_str or not user_id_str.isdigit():
-            await callback.answer("Ошибка: неверный ID пользователя", show_alert=True)
-            return
-            
-        # Преобразуем в str только после всех проверок
-        chosen_user_id = user_id_str
-        
-        data = load_users()
-        users = data["users"]
-        
-        # Проверяем, что пользователь существует
-        if chosen_user_id not in users:
-            await callback.answer("Ошибка: пользователь не найден", show_alert=True)
-            return
-        
-        # Получаем mentor_id из данных пользователя
-        mentor_id = users[chosen_user_id].get("pending_mentor")
-        if not mentor_id:
-            await callback.answer("Ошибка: не найден запрос на наставничество", show_alert=True)
-            return
-        
-        # Проверяем, что текущий пользователь действительно является ожидаемым наставником
-        if str(callback.from_user.id) != mentor_id:
-            await callback.answer("Ошибка: вы не являетесь ожидаемым наставником", show_alert=True)
-            return
-        
-        # Отклоняем наставника
-        users[chosen_user_id].pop("pending_mentor", None)
-        
-        if not save_users(data):
-            await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
-            return
+    chosen_user_id = callback.data.split(":")[1]
+    data = load_users()
+    users = data["users"]
 
-        await callback.message.edit_text("Отказано.")
-        await bot.send_message(chosen_user_id, "Наставник отклонил ваш выбор.")
-        
-    except Exception as e:
-        # Логируем ошибку для отладки
-        log_error(f"Ошибка в mentor_decline: {e}")
-        log_error(f"Callback data: {callback.data if callback else 'No callback'}")
-        
-        # Уведомляем пользователя об ошибке
-        await callback.answer("Произошла ошибка при обработке запроса", show_alert=True)
+    users[chosen_user_id].pop("pending_mentor", None)
+    
+    if not save_users(data):
+        await callback.answer("❌ Ошибка сохранения данных", show_alert=True)
+        return
+
+    await callback.message.edit_text("Отказано.")
+    await bot.send_message(chosen_user_id, "Наставник отклонил ваш выбор.")
 
 # --- ИЗМЕНЕНИЕ НАСТАВНИКА ---
 @dp.callback_query_handler(lambda c: c.data == "change_mentor_btn")
@@ -2297,6 +1781,18 @@ async def student_profile(callback):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("👥 Его ученики", callback_data=f"child_students:{user_id}"))
     
+    # НОВОЕ: Добавляем кнопку просмотра диалога
+    current_user_id = str(callback.from_user.id)
+    
+    # Проверяем, является ли текущий пользователь наставником этого ученика
+    is_mentor = u.get("mentor") == current_user_id
+    
+    # Проверяем, является ли текущий пользователь админом
+    is_admin = callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]
+    
+    if is_mentor or is_admin:
+        kb.add(InlineKeyboardButton("💬 Просмотреть диалог", callback_data=f"view_conversation:{user_id}"))
+    
     if source == "BRANCH":
         kb.add(InlineKeyboardButton("⬅ Назад к ветке", callback_data="my_full_branch"))
     elif source in LEVELS_ORDER:
@@ -2506,9 +2002,9 @@ async def cancel_broadcast(callback):
     await callback.message.edit_text("❌ Рассылка отменена.")
     await admin_main_menu(callback.from_user.id)
 
-# --- НОВЫЙ ОБРАБОТЧИК РАССЫЛКИ С УЛУЧШЕННЫМИ УВЕДОМЛЕНИЯМИ ---
+# --- ОБРАБОТЧИК РАССЫЛКИ С ЗАДАНИЕМ ---
 @dp.message_handler(state=Form.admin_message, content_types=types.ContentTypes.ANY)
-async def admin_send_message_enhanced(message, state):
+async def admin_send_message(message, state):
     data = await state.get_data()
     selected_levels = data.get("selected_levels", [])
     broadcast_to_all = data.get("broadcast_to_all", False)
@@ -2577,10 +2073,10 @@ async def admin_send_message_enhanced(message, state):
         await message.answer(preview_text, reply_markup=kb)
         return
     
-    # Обычная рассылка с улучшенным предпросмотром
+    # Обычная рассылка
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("✅ Отправить", callback_data="confirm_send_enhanced"),
+        InlineKeyboardButton("✅ Отправить", callback_data="confirm_send"),
         InlineKeyboardButton("❌ Отмена", callback_data="cancel_send")
     )
     
@@ -2612,65 +2108,10 @@ async def admin_send_message_enhanced(message, state):
     
     await message.answer(preview_text, reply_markup=kb)
 
-# --- НОВЫЙ ОБРАБОТЧИК ПОДТВЕРЖДЕНИЯ РАССЫЛКИ С УЛУЧШЕННЫМИ УВЕДОМЛЕНИЯМИ ---
-@dp.callback_query_handler(lambda c: c.data == "confirm_send_enhanced", state=Form.admin_message)
-async def confirm_send_enhanced(callback, state):
-    """Улучшенный обработчик подтверждения рассылки"""
-    data = await state.get_data()
-    message = data.get("message_to_send")
-    recipients = data.get("recipients", [])
-    selected_levels = data.get("selected_levels", [])
-    broadcast_to_all = data.get("broadcast_to_all", False)
-    is_assignment = data.get("is_assignment", False)
-    
-    await callback.message.edit_text(f"🔄 Начинаю рассылку...")
-    
-    # Формируем описание целевой аудитории
-    if broadcast_to_all:
-        target_description = "ВСЕМ пользователям"
-    elif selected_levels:
-        target_description = f"уровням: {', '.join(selected_levels)}"
-    else:
-        target_description = "выбранным пользователям"
-    
-    # Определяем тип рассылки
-    broadcast_type = "assignment" if is_assignment else "regular"
-    
-    # Используем улучшенную функцию рассылки
-    broadcast_id = await enhanced_broadcast(
-        admin_id=callback.from_user.id,
-        message=message,
-        recipients=recipients,
-        target_description=target_description,
-        broadcast_type=broadcast_type
-    )
-    
-    await state.finish()
-    
-    # Дополнительное меню для администратора
-    if callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]:
-        kb = InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            InlineKeyboardButton("📊 Статус рассылки", callback_data=f"broadcast_status:{broadcast_id}"),
-            InlineKeyboardButton("📋 Список ошибок", callback_data=f"failed_list:{broadcast_id}:1")
-        )
-        kb.add(
-            InlineKeyboardButton("📢 Новая рассылка", callback_data="admin_broadcast"),
-            InlineKeyboardButton("⬅️ В меню", callback_data="back_main")
-        )
-        
-        await callback.message.answer(
-            f"✅ Рассылка запущена!\n\n"
-            f"ID рассылки: <code>{broadcast_id}</code>\n"
-            f"Вы получите уведомление о завершении.",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
-
-# --- НОВЫЙ ОБРАБОТЧИК ОТПРАВКИ КАК ЗАДАНИЕ С УЛУЧШЕННЫМИ УВЕДОМЛЕНИЯМИ ---
+# --- ОТПРАВКА КАК ЗАДАНИЕ ---
 @dp.callback_query_handler(lambda c: c.data == "send_as_assignment", state=Form.admin_message)
-async def send_as_assignment_enhanced(callback: types.CallbackQuery, state):
-    """Администратор отправляет задание ученикам с улучшенными уведомлениями"""
+async def send_as_assignment(callback: types.CallbackQuery, state):
+    """Администратор отправляет задание ученикам"""
     data = await state.get_data()
     message = data.get("message_to_send")
     selected_levels = data.get("selected_levels", [])
@@ -2684,7 +2125,6 @@ async def send_as_assignment_enhanced(callback: types.CallbackQuery, state):
     
     # Создаем уникальный ID для задания
     assignment_id = f"assignment_{message.from_user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    broadcast_id = f"broadcast_assignment_{assignment_id}"
     
     # Получаем имя администратора
     admin_name = "Ольга" if callback.from_user.id == OLGA_ID else "Суперадмин"
@@ -2692,15 +2132,13 @@ async def send_as_assignment_enhanced(callback: types.CallbackQuery, state):
     # Собираем информацию о задании
     assignment_info = {
         "assignment_id": assignment_id,
-        "broadcast_id": broadcast_id,
         "from_admin": True,
         "admin_id": str(callback.from_user.id),
         "admin_name": admin_name,
         "levels": selected_levels if not broadcast_to_all else ["ALL"],
         "timestamp": str(datetime.now()),
         "content_type": message.content_type,
-        "sent_count": 0,
-        "solutions_count": 0
+        "sent_count": 0
     }
     
     if message.content_type == "text":
@@ -2717,42 +2155,13 @@ async def send_as_assignment_enhanced(callback: types.CallbackQuery, state):
         assignment_info["video_id"] = message.video.file_id
         assignment_info["caption"] = message.caption
     
-    # Формируем описание целевой аудитории для уведомления
-    if broadcast_to_all:
-        target_description = "ВСЕМ ученикам"
-    elif selected_levels:
-        target_description = f"ученикам уровней: {', '.join(selected_levels)}"
-    else:
-        target_description = "выбранным ученикам"
-    
     # Отправляем задание всем ученикам выбранных уровней
-    recipients = []
     sent_to_students = []
-    failed_deliveries = []
+    failed_students = []
     
-    await send_admin_notification(
-        callback.from_user.id,
-        "Начинаю отправку задания",
-        f"🔹 Тип: Задание от администратора\n"
-        f"🔹 Администратор: {admin_name}\n"
-        f"🔹 Целевая аудитория: {target_description}",
-        broadcast_id
-    )
-    
-    total_students = 0
     for uid, u in users_data.items():
-        if (broadcast_to_all or u.get("level") in selected_levels) and int(uid) not in [OLGA_ID, YOUR_ADMIN_ID]:
-            total_students += 1
-    
-    sent_count = 0
-    failed_count = 0
-    
-    for i, (uid, u) in enumerate(users_data.items(), 1):
         # Проверяем, что пользователь ученик (не админ) и его уровень в выбранных
         if (broadcast_to_all or u.get("level") in selected_levels) and int(uid) not in [OLGA_ID, YOUR_ADMIN_ID]:
-            
-            recipients.append(uid)
-            user_name = f"{u['name']} {u.get('surname', '')}".strip()
             
             try:
                 # Создаем клавиатуру для ученика
@@ -2785,41 +2194,16 @@ async def send_as_assignment_enhanced(callback: types.CallbackQuery, state):
                 
                 sent_to_students.append({
                     "student_id": uid,
-                    "student_name": user_name,
+                    "student_name": f"{u['name']} {u.get('surname','')}".strip(),
                     "mentor_id": u.get("mentor"),
                     "level": u.get("level")
                 })
                 
                 assignment_info["sent_count"] += 1
-                sent_count += 1
-                
-                # Периодически отправляем обновление о прогрессе
-                if i % 10 == 0:
-                    await send_broadcast_progress_update(
-                        callback.from_user.id, broadcast_id, i, total_students, sent_count, failed_count
-                    )
-                
-                await asyncio.sleep(0.1)
                 
             except Exception as e:
-                failed_count += 1
-                error_type = classify_error(str(e))
-                error_message = str(e)
-                
-                failed_deliveries.append({
-                    "user_id": uid,
-                    "user_name": user_name,
-                    "error_type": error_type,
-                    "error_message": error_message,
-                    "timestamp": str(datetime.now())
-                })
-                
-                # Сохраняем в историю
-                add_failed_delivery(
-                    broadcast_id, uid, user_name, error_type, error_message, str(datetime.now())
-                )
-                
-                log_error(f"Ошибка отправки задания ученику {uid}: {error_type} - {error_message}")
+                failed_students.append(f"{u['name']} {u.get('surname','')}")
+                log_error(f"Ошибка отправки задания ученику {uid}: {e}")
     
     # Сохраняем задание
     assignments_data.setdefault("assignments", {})[assignment_id] = assignment_info
@@ -2828,285 +2212,47 @@ async def send_as_assignment_enhanced(callback: types.CallbackQuery, state):
     assignments_data.setdefault("assignment_recipients", {})[assignment_id] = sent_to_students
     
     if save_assignments(assignments_data):
-        # Сохраняем информацию о рассылке в историю
-        add_broadcast_to_history(
-            broadcast_id=broadcast_id,
-            admin_id=str(callback.from_user.id),
-            target=target_description,
-            recipients_count=len(recipients),
-            sent_count=sent_count,
-            failed_count=failed_count,
-            message_type=message.content_type,
-            timestamp=str(datetime.now())
-        )
+        # Формируем отчет для администратора
+        report_text = f"✅ <b>Задание успешно отправлено!</b>\n\n"
+        report_text += f"• ID задания: <code>{assignment_id}</code>\n"
         
-        # Отправляем итоговую сводку
-        await send_broadcast_summary(
-            callback.from_user.id, broadcast_id, len(recipients), 
-            sent_count, failed_count, target_description, failed_deliveries
-        )
+        if broadcast_to_all:
+            report_text += f"• Все ученики\n"
+        else:
+            report_text += f"• Уровни: {', '.join(selected_levels)}\n"
+            
+        report_text += f"• Отправлено ученикам: {len(sent_to_students)}\n"
         
-        # Дополнительное меню для задания
-        kb_admin = InlineKeyboardMarkup(row_width=2)
+        if sent_to_students:
+            report_text += f"\n<b>Получили задание:</b>\n"
+            for i, student in enumerate(sent_to_students[:20], 1):  # Показываем первые 20
+                mentor_info = ""
+                if student["mentor_id"] and student["mentor_id"] in users_data:
+                    mentor = users_data[student["mentor_id"]]
+                    mentor_info = f" → {mentor['name']}"
+                report_text += f"{i}. {student['student_name']}{mentor_info}\n"
+            
+            if len(sent_to_students) > 20:
+                report_text += f"... и еще {len(sent_to_students) - 20} учеников\n"
+        
+        if failed_students:
+            report_text += f"\n❌ <b>Не отправлено ({len(failed_students)}):</b>\n"
+            report_text += ", ".join(failed_students[:10])
+            if len(failed_students) > 10:
+                report_text += f"... и еще {len(failed_students) - 10}"
+        
+        # Кнопки для администратора
+        kb_admin = InlineKeyboardMarkup()
         kb_admin.add(
             InlineKeyboardButton("📊 Статус выполнения", callback_data=f"check_assignment:{assignment_id}"),
-            InlineKeyboardButton("📋 Ошибки доставки", callback_data=f"failed_list:{broadcast_id}:1")
-        )
-        kb_admin.add(
-            InlineKeyboardButton("📝 Новое задание", callback_data="admin_broadcast"),
-            InlineKeyboardButton("⬅️ В меню", callback_data="back_main")
+            InlineKeyboardButton("📝 Новое задание", callback_data="admin_broadcast")
         )
         
-        await callback.message.answer(
-            f"✅ Задание успешно создано!\n\n"
-            f"ID задания: <code>{assignment_id}</code>\n"
-            f"ID рассылки: <code>{broadcast_id}</code>",
-            reply_markup=kb_admin,
-            parse_mode="HTML"
-        )
+        await callback.message.edit_text(report_text, reply_markup=kb_admin, parse_mode="HTML")
     else:
         await callback.message.edit_text("❌ Ошибка сохранения задания")
     
     await state.finish()
-
-# --- НОВЫЕ ОБРАБОТЧИКИ ДЛЯ ПРОСМОТРА ОШИБОК И СТАТИСТИКИ ---
-
-@dp.callback_query_handler(lambda c: c.data.startswith("broadcast_report:"))
-async def show_broadcast_report(callback: types.CallbackQuery):
-    """Показать детальный отчет по рассылке"""
-    broadcast_id = callback.data.split(":")[1]
-    
-    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
-        await callback.answer("Доступ только для администраторов", show_alert=True)
-        return
-    
-    broadcast_stats = get_broadcast_stats(broadcast_id)
-    if not broadcast_stats:
-        await callback.answer("Рассылка не найдена", show_alert=True)
-        return
-    
-    failed_deliveries = get_failed_deliveries_by_broadcast(broadcast_id)
-    error_groups = group_errors_by_type(failed_deliveries)
-    
-    text = f"📊 <b>ДЕТАЛЬНЫЙ ОТЧЕТ ПО РАССЫЛКЕ</b>\n\n"
-    text += f"🔹 ID: <code>{broadcast_id}</code>\n"
-    text += f"🔹 Целевая аудитория: {broadcast_stats['target']}\n"
-    text += f"🔹 Дата: {broadcast_stats['timestamp']}\n"
-    text += f"🔹 Тип сообщения: {broadcast_stats['message_type']}\n\n"
-    
-    text += f"<b>СТАТИСТИКА:</b>\n"
-    text += f"• Всего получателей: {broadcast_stats['recipients_count']}\n"
-    text += f"• Успешно отправлено: {broadcast_stats['sent_count']}\n"
-    text += f"• Не отправлено: {broadcast_stats['failed_count']}\n\n"
-    
-    if error_groups:
-        text += f"<b>ГРУППИРОВКА ОШИБОК:</b>\n"
-        for error_type, errors in error_groups.items():
-            error_name = BROADCAST_ERROR_TYPES.get(error_type, "Неизвестная ошибка")
-            text += f"\n📌 <b>{error_name}</b> ({len(errors)}):\n"
-            for error in errors[:5]:  # Показываем только первые 5
-                text += f"   • {error['user_name']} (ID: {error['user_id']})\n"
-            if len(errors) > 5:
-                text += f"   ... и еще {len(errors) - 5}\n"
-    
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("📋 Полный список ошибок", 
-                               callback_data=f"failed_list:{broadcast_id}:1"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="admin_broadcast"))
-    
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query_handler(lambda c: c.data.startswith("failed_list:"))
-async def show_failed_list(callback: types.CallbackQuery):
-    """Показать полный список неудачных отправок с постраничной навигацией"""
-    parts = callback.data.split(":")
-    broadcast_id = parts[1]
-    page = int(parts[2]) if len(parts) > 2 else 1
-    
-    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
-        await callback.answer("Доступ только для администраторов", show_alert=True)
-        return
-    
-    failed_deliveries = get_failed_deliveries_by_broadcast(broadcast_id)
-    if not failed_deliveries:
-        await callback.answer("Нет неудачных отправок", show_alert=True)
-        return
-    
-    # Пагинация
-    items_per_page = 10
-    total_pages = (len(failed_deliveries) + items_per_page - 1) // items_per_page
-    start_idx = (page - 1) * items_per_page
-    end_idx = start_idx + items_per_page
-    page_items = failed_deliveries[start_idx:end_idx]
-    
-    text = f"📋 <b>СПИСОК НЕОТПРАВЛЕННЫХ СООБЩЕНИЙ</b>\n\n"
-    text += f"🔹 ID рассылки: <code>{broadcast_id}</code>\n"
-    text += f"🔹 Всего ошибок: {len(failed_deliveries)}\n"
-    text += f"🔹 Страница {page} из {total_pages}\n\n"
-    
-    for i, delivery in enumerate(page_items, start_idx + 1):
-        error_name = BROADCAST_ERROR_TYPES.get(delivery['error_type'], "Неизвестная ошибка")
-        text += f"{i}. <b>{delivery['user_name']}</b>\n"
-        text += f"   ID: {delivery['user_id']}\n"
-        text += f"   Ошибка: {error_name}\n"
-        if len(delivery['error_message']) < 100:
-            text += f"   Сообщение: {delivery['error_message']}\n"
-        text += "\n"
-    
-    # Клавиатура для навигации
-    kb = InlineKeyboardMarkup(row_width=5)
-    
-    # Кнопки навигации
-    nav_buttons = []
-    if page > 1:
-        nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"failed_list:{broadcast_id}:{page-1}"))
-    
-    nav_buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    
-    if page < total_pages:
-        nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"failed_list:{broadcast_id}:{page+1}"))
-    
-    if nav_buttons:
-        kb.row(*nav_buttons)
-    
-    kb.add(
-        InlineKeyboardButton("📊 Детальный отчет", callback_data=f"broadcast_report:{broadcast_id}"),
-        InlineKeyboardButton("🔄 Повторить ошибки", callback_data=f"retry_failed:{broadcast_id}")
-    )
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="admin_broadcast"))
-    
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query_handler(lambda c: c.data.startswith("broadcast_status:"))
-async def show_broadcast_status(callback: types.CallbackQuery):
-    """Показать статус рассылки"""
-    broadcast_id = callback.data.split(":")[1]
-    
-    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
-        await callback.answer("Доступ только для администраторов", show_alert=True)
-        return
-    
-    broadcast_stats = get_broadcast_stats(broadcast_id)
-    if not broadcast_stats:
-        await callback.answer("Рассылка не найдена", show_alert=True)
-        return
-    
-    text = f"📊 <b>СТАТУС РАССЫЛКИ</b>\n\n"
-    text += f"🔹 ID: <code>{broadcast_id}</code>\n"
-    text += f"🔹 Администратор: {broadcast_stats['admin_id']}\n"
-    text += f"🔹 Дата: {broadcast_stats['timestamp']}\n"
-    text += f"🔹 Целевая аудитория: {broadcast_stats['target']}\n\n"
-    
-    text += f"<b>СТАТИСТИКА ДОСТАВКИ:</b>\n"
-    text += f"• Всего получателей: {broadcast_stats['recipients_count']}\n"
-    text += f"• Успешно отправлено: {broadcast_stats['sent_count']}\n"
-    text += f"• Не отправлено: {broadcast_stats['failed_count']}\n"
-    
-    success_rate = (broadcast_stats['sent_count'] / broadcast_stats['recipients_count'] * 100) \
-        if broadcast_stats['recipients_count'] > 0 else 0
-    text += f"• Успешность: {success_rate:.1f}%\n"
-    
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("📋 Детальный отчет", callback_data=f"broadcast_report:{broadcast_id}"),
-        InlineKeyboardButton("📊 Общая статистика", callback_data="broadcast_stats_overview")
-    )
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="admin_broadcast"))
-    
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query_handler(lambda c: c.data == "broadcast_stats_overview")
-async def show_broadcast_stats_overview(callback: types.CallbackQuery):
-    """Показать общую статистику по всем рассылкам"""
-    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
-        await callback.answer("Доступ только для администраторов", show_alert=True)
-        return
-    
-    history = load_broadcast_history()
-    stats = history.get("stats", {})
-    broadcasts = history.get("broadcasts", {})
-    
-    text = f"📈 <b>ОБЩАЯ СТАТИСТИКА РАССЫЛОК</b>\n\n"
-    text += f"• Всего рассылок: {stats.get('total_broadcasts', 0)}\n"
-    text += f"• Всего отправлено сообщений: {stats.get('total_sent', 0)}\n"
-    text += f"• Всего ошибок доставки: {stats.get('total_failed', 0)}\n\n"
-    
-    if broadcasts:
-        # Последние 5 рассылок
-        text += f"<b>ПОСЛЕДНИЕ РАССЫЛКИ:</b>\n"
-        recent_broadcasts = sorted(
-            broadcasts.items(),
-            key=lambda x: x[1].get('timestamp', ''),
-            reverse=True
-        )[:5]
-        
-        for i, (broadcast_id, broadcast_data) in enumerate(recent_broadcasts, 1):
-            date_str = broadcast_data.get('timestamp', '')[:16]
-            success_rate = (broadcast_data['sent_count'] / broadcast_data['recipients_count'] * 100) \
-                if broadcast_data['recipients_count'] > 0 else 0
-            
-            text += f"\n{i}. {date_str}\n"
-            text += f"   📊 {broadcast_data['sent_count']}/{broadcast_data['recipients_count']} "
-            text += f"({success_rate:.0f}%)\n"
-            text += f"   🎯 {broadcast_data['target'][:30]}...\n"
-    
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🧹 Очистить старые данные", callback_data="cleanup_old_data"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="admin_broadcast"))
-    
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query_handler(lambda c: c.data.startswith("retry_failed:"))
-async def retry_failed_deliveries(callback: types.CallbackQuery):
-    """Повторная отправка сообщений с ошибками"""
-    broadcast_id = callback.data.split(":")[1]
-    
-    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
-        await callback.answer("Доступ только для администраторов", show_alert=True)
-        return
-    
-    # Нужно найти оригинальное сообщение рассылки
-    # В реальной реализации нужно хранить само сообщение или его параметры
-    # Здесь упрощенный вариант - запрашиваем сообщение заново
-    
-    await callback.message.answer(
-        "🔄 <b>Повторная отправка сообщений с ошибками</b>\n\n"
-        "Отправьте сообщение, которое нужно повторно отправить пользователям, "
-        "у которых была ошибка доставки.",
-        parse_mode="HTML"
-    )
-    
-    state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
-    await state.update_data(
-        retry_broadcast_id=broadcast_id,
-        is_retry=True
-    )
-    
-    await Form.admin_message.set()
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "cleanup_old_data")
-async def cleanup_data_handler(callback: types.CallbackQuery):
-    """Очистка старых данных"""
-    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
-        await callback.answer("Доступ только для администраторов", show_alert=True)
-        return
-    
-    await callback.message.answer("🧹 Начинаю очистку старых данных...")
-    
-    cleaned_count = cleanup_old_data(days_to_keep=7)
-    
-    await callback.message.answer(
-        f"✅ Очистка завершена!\n\n"
-        f"• Удалено старых рассылок: {cleaned_count}\n"
-        f"• Удалены старые backup файлы\n"
-        f"• Данные актуальны (хранятся 7 дней)"
-    )
-
-@dp.callback_query_handler(lambda c: c.data == "noop")
-async def noop_handler(callback: types.CallbackQuery):
-    """Пустой обработчик для кнопок-заглушек"""
-    await callback.answer()
 
 # --- ПРОСМОТР РЕШЕНИЙ УЧЕНИКОВ ---
 @dp.callback_query_handler(lambda c: c.data == "view_student_solutions")
@@ -3296,11 +2442,11 @@ async def receive_solution_from_student(message: types.Message, state):
     
     if save_assignments(assignments_data):
         try:
-            # Отправляем решение наставнику с кнопкой для ответа
+            # Отправляем решение наставнику
             kb_mentor = InlineKeyboardMarkup(row_width=2)
             kb_mentor.add(
                 InlineKeyboardButton("💬 Ответить ученику", 
-                                   callback_data=f"start_dialogue:{student_id}:{assignment_id}"),
+                                   callback_data=f"reply_to_student:{student_id}:{assignment_id}"),
                 InlineKeyboardButton("👀 Просмотреть задание", 
                                    callback_data=f"view_assignment:{assignment_id}")
             )
@@ -3312,7 +2458,7 @@ async def receive_solution_from_student(message: types.Message, state):
                     f"👤 <b>Ученик:</b> {student_name}\n"
                     f"📚 <b>Задание от {admin_name}:</b>\n{assignment_text}\n\n"
                     f"<b>Решение ученика:</b>\n{message.text}\n\n"
-                    f"<i>Нажмите кнопку ниже, чтобы начать диалог с учеником</i>",
+                    f"<i>Вы можете ответить ученику или просмотреть полное задание</i>",
                     reply_markup=kb_mentor,
                     parse_mode="HTML"
                 )
@@ -3324,22 +2470,15 @@ async def receive_solution_from_student(message: types.Message, state):
                            f"👤 <b>Ученик:</b> {student_name}\n"
                            f"📚 <b>Задание от {admin_name}:</b>\n{assignment_text}\n\n"
                            f"<b>Решение ученика:</b>\n{message.caption or 'Фото решения'}\n\n"
-                           f"<i>Нажмите кнопку ниже, чтобы начать диалог с учеником</i>",
+                           f"<i>Вы можете ответить ученику или просмотреть полное задание</i>",
                     reply_markup=kb_mentor,
                     parse_mode="HTML"
                 )
             
-            # Уведомляем ученика с кнопкой для диалога
-            kb_student = InlineKeyboardMarkup()
-            kb_student.add(
-                InlineKeyboardButton("💬 Начать диалог с наставником", 
-                                   callback_data=f"start_dialogue:{mentor_id}:{assignment_id}")
-            )
-            
+            # Уведомляем ученика
             await message.answer(
                 f"✅ Ваше решение отправлено наставнику <b>{mentor_name}</b>!\n\n"
-                f"Ожидайте обратной связи. Вы можете начать диалог с наставником, нажав кнопку ниже.",
-                reply_markup=kb_student
+                f"Ожидайте обратной связи. Наставник может ответить вам здесь."
             )
             
             # Обновляем статистику задания
@@ -3368,302 +2507,127 @@ async def receive_solution_from_student(message: types.Message, state):
     
     await state.finish()
 
-# --- НАСТАВНИК НАЧИНАЕТ ДИАЛОГ С УЧЕНИКОМ ---
-@dp.callback_query_handler(lambda c: c.data.startswith("start_dialogue:"))
-async def start_dialogue_handler(callback: types.CallbackQuery):
-    """Начало диалога между наставником и учеником"""
+# --- НАСТАВНИК ОТВЕЧАЕТ УЧЕНИКУ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("reply_to_student:"))
+async def reply_to_student_handler(callback: types.CallbackQuery):
+    """Наставник отвечает ученику на решение"""
     parts = callback.data.split(":")
-    partner_id = parts[1]
+    student_id = parts[1]
     assignment_id = parts[2] if len(parts) > 2 else None
     
-    user_id = str(callback.from_user.id)
-    users_data = load_users()["users"]
-    
-    # Проверяем, существуют ли оба пользователя
-    if user_id not in users_data or partner_id not in users_data:
-        await callback.answer("Ошибка: пользователь не найден", show_alert=True)
-        return
-    
-    user = users_data[user_id]
-    partner = users_data[partner_id]
-    
-    # Проверяем отношения наставник-ученик
-    is_mentor_to_student = (user.get("mentor") == partner_id) or any(
-        u.get("mentor") == user_id for uid, u in users_data.items() if uid == partner_id
+    # Сохраняем данные в состоянии
+    state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
+    await state.update_data(
+        reply_to_student=student_id,
+        reply_assignment_id=assignment_id
     )
     
-    if not is_mentor_to_student:
-        await callback.answer("Диалог возможен только между наставником и его учеником", show_alert=True)
-        return
-    
-    # Определяем, кто наставник, а кто ученик
-    if user.get("mentor") == partner_id:
-        # Пользователь - ученик, партнер - наставник
-        user_role = "ученик"
-        partner_role = "наставник"
-        user_state = DialogueStates.in_dialogue_with_mentor
-        partner_state = DialogueStates.in_dialogue_with_student
-    else:
-        # Пользователь - наставник, партнер - ученик
-        user_role = "наставник"
-        partner_role = "ученик"
-        user_state = DialogueStates.in_dialogue_with_student
-        partner_state = DialogueStates.in_dialogue_with_mentor
-    
-    # Сохраняем состояние диалога
-    save_dialogue_state(user_id, partner_id, assignment_id)
-    
-    # Уведомляем обоих пользователей
-    user_name = f"{user['name']} {user.get('surname','')}".strip()
-    partner_name = f"{partner['name']} {partner.get('surname','')}".strip()
-    
-    # Клавиатура для управления диалогом
-    kb_dialogue = InlineKeyboardMarkup(row_width=1)
-    kb_dialogue.add(
-        InlineKeyboardButton("🚫 Завершить диалог", callback_data="end_dialogue")
+    await callback.message.answer(
+        "💬 <b>Ответ ученику</b>\n\n"
+        "Отправьте ваше сообщение ученику.\n"
+        "Это может быть:\n"
+        "• Обратная связь по решению\n"
+        "• Исправления\n"
+        "• Похвала\n"
+        "• Вопросы по решению\n\n"
+        "<i>Сообщение будет отправлено ученику и сохранено в истории</i>"
     )
     
-    # Сообщение для инициатора диалога
-    await callback.message.edit_text(
-        f"💬 <b>Диалог начат</b>\n\n"
-        f"Вы начали диалог с {partner_role} <b>{partner_name}</b>.\n"
-        f"Теперь все ваши сообщения будут пересылаться собеседнику.\n\n"
-        f"<i>Чтобы завершить диалог, нажмите кнопку ниже</i>",
-        reply_markup=kb_dialogue
-    )
-    
-    # Сообщение для собеседника
-    await bot.send_message(
-        partner_id,
-        f"💬 <b>Начат диалог</b>\n\n"
-        f"Ваш {user_role} <b>{user_name}</b> начал диалог с вами.\n"
-        f"Теперь все ваши сообщения будут пересылаться собеседнику.\n\n"
-        f"<i>Чтобы завершить диалог, нажмите кнопку ниже</i>",
-        reply_markup=kb_dialogue
-    )
-    
-    # Устанавливаем состояния для обоих пользователей
-    state_user = dp.current_state(user=int(user_id), chat=int(user_id))
-    await state_user.set(user_state)
-    await state_user.update_data(dialogue_with=partner_id, assignment_id=assignment_id)
-    
-    state_partner = dp.current_state(user=int(partner_id), chat=int(partner_id))
-    await state_partner.set(partner_state)
-    await state_partner.update_data(dialogue_with=user_id, assignment_id=assignment_id)
-    
-    await callback.answer("Диалог начат!")
+    await AssignmentStates.mentor_reply.set()
 
-# --- ОБРАБОТКА СООБЩЕНИЙ В ДИАЛОГЕ ---
-@dp.message_handler(state=DialogueStates.in_dialogue_with_mentor, content_types=types.ContentTypes.ANY)
-async def handle_student_dialogue_message(message: types.Message, state):
-    """Обработка сообщений от ученика в диалоге с наставником"""
-    user_id = str(message.from_user.id)
+# --- ПОЛУЧЕНИЕ ОТВЕТА ОТ НАСТАВНИКА ---
+@dp.message_handler(state=AssignmentStates.mentor_reply, content_types=types.ContentTypes.ANY)
+async def receive_mentor_reply(message: types.Message, state):
+    """Получение ответа от наставника и отправка ученику"""
+    mentor_id = str(message.from_user.id)
     data = await state.get_data()
-    mentor_id = data.get("dialogue_with")
     
-    if not mentor_id:
-        await message.answer("❌ Ошибка: собеседник не найден")
-        await state.finish()
-        return
-    
-    # Получаем информацию о пользователях
-    users_data = load_users()["users"]
-    if user_id not in users_data or mentor_id not in users_data:
-        await message.answer("❌ Ошибка: пользователь не найден")
-        await state.finish()
-        return
-    
-    student = users_data[user_id]
-    mentor = users_data[mentor_id]
-    
-    student_name = f"{student['name']} {student.get('surname','')}".strip()
-    mentor_name = f"{mentor['name']} {mentor.get('surname','')}".strip()
-    
-    # Клавиатура для получателя
-    kb_receiver = InlineKeyboardMarkup()
-    kb_receiver.add(InlineKeyboardButton("🚫 Завершить диалог", callback_data="end_dialogue"))
-    
-    # Клавиатура для отправителя
-    kb_sender = InlineKeyboardMarkup()
-    kb_sender.add(InlineKeyboardButton("🚫 Завершить диалог", callback_data="end_dialogue"))
-    
-    try:
-        # Сохраняем сообщение в истории
-        message_data = {
-            "content_type": message.content_type,
-            "text": message.text if message.content_type == "text" else None,
-            "photo_id": message.photo[-1].file_id if message.content_type == "photo" else None,
-            "document_id": message.document.file_id if message.content_type == "document" else None,
-            "voice_id": message.voice.file_id if message.content_type == "voice" else None,
-            "caption": message.caption
-        }
-        
-        save_dialogue_message(user_id, mentor_id, message_data)
-        
-        # Отправляем сообщение наставнику
-        if message.content_type == "text":
-            await bot.send_message(
-                mentor_id,
-                f"💬 <b>Сообщение от ученика {student_name}</b>\n\n{message.text}",
-                reply_markup=kb_receiver,
-                parse_mode="HTML"
-            )
-        elif message.content_type == "photo":
-            await bot.send_photo(
-                mentor_id,
-                message.photo[-1].file_id,
-                caption=f"💬 <b>Сообщение от ученика {student_name}</b>\n\n{message.caption or ''}",
-                reply_markup=kb_receiver,
-                parse_mode="HTML"
-            )
-        elif message.content_type == "document":
-            await bot.send_document(
-                mentor_id,
-                message.document.file_id,
-                caption=f"💬 <b>Сообщение от ученика {student_name}</b>\n\n{message.caption or ''}",
-                reply_markup=kb_receiver,
-                parse_mode="HTML"
-            )
-        elif message.content_type == "voice":
-            await bot.send_voice(
-                mentor_id,
-                message.voice.file_id,
-                caption=f"💬 <b>Голосовое сообщение от ученика {student_name}</b>",
-                reply_markup=kb_receiver,
-                parse_mode="HTML"
-            )
-        
-        # Подтверждение для ученика
-        await message.answer(
-            f"✅ Сообщение отправлено наставнику <b>{mentor_name}</b>",
-            reply_markup=kb_sender
-        )
-        
-    except Exception as e:
-        log_error(f"Ошибка отправки сообщения в диалоге: {e}")
-        await message.answer(f"❌ Ошибка отправки сообщения: {e}")
-
-@dp.message_handler(state=DialogueStates.in_dialogue_with_student, content_types=types.ContentTypes.ANY)
-async def handle_mentor_dialogue_message(message: types.Message, state):
-    """Обработка сообщений от наставника в диалоге с учеником"""
-    user_id = str(message.from_user.id)
-    data = await state.get_data()
-    student_id = data.get("dialogue_with")
+    student_id = data.get("reply_to_student")
+    assignment_id = data.get("reply_assignment_id")
     
     if not student_id:
-        await message.answer("❌ Ошибка: собеседник не найден")
+        await message.answer("❌ Ошибка: ученик не указан")
         await state.finish()
         return
     
-    # Получаем информацию о пользователях
+    # Загружаем данные
     users_data = load_users()["users"]
-    if user_id not in users_data or student_id not in users_data:
-        await message.answer("❌ Ошибка: пользователь не найден")
+    
+    # Проверяем, что наставник действительно наставник этого ученика
+    student = users_data.get(student_id)
+    if not student or student.get("mentor") != mentor_id:
+        await message.answer("❌ Ошибка: вы не являетесь наставником этого ученика")
         await state.finish()
         return
     
-    mentor = users_data[user_id]
-    student = users_data[student_id]
-    
-    mentor_name = f"{mentor['name']} {mentor.get('surname','')}".strip()
+    mentor = users_data.get(mentor_id)
     student_name = f"{student['name']} {student.get('surname','')}".strip()
+    mentor_name = f"{mentor['name']} {mentor.get('surname','')}".strip()
     
-    # Клавиатура для получателя
-    kb_receiver = InlineKeyboardMarkup()
-    kb_receiver.add(InlineKeyboardButton("🚫 Завершить диалог", callback_data="end_dialogue"))
+    # Сохраняем ответ в истории
+    assignments_data = load_assignments()
     
-    # Клавиатура для отправителя
-    kb_sender = InlineKeyboardMarkup()
-    kb_sender.add(InlineKeyboardButton("🚫 Завершить диалог", callback_data="end_dialogue"))
+    reply_id = f"reply_{mentor_id}_{student_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    try:
-        # Сохраняем сообщение в истории
-        message_data = {
-            "content_type": message.content_type,
-            "text": message.text if message.content_type == "text" else None,
-            "photo_id": message.photo[-1].file_id if message.content_type == "photo" else None,
-            "document_id": message.document.file_id if message.content_type == "document" else None,
-            "voice_id": message.voice.file_id if message.content_type == "voice" else None,
-            "caption": message.caption
-        }
-        
-        save_dialogue_message(user_id, student_id, message_data)
-        
-        # Отправляем сообщение ученику
-        if message.content_type == "text":
-            await bot.send_message(
-                student_id,
-                f"💬 <b>Сообщение от наставника {mentor_name}</b>\n\n{message.text}",
-                reply_markup=kb_receiver,
-                parse_mode="HTML"
+    reply_info = {
+        "reply_id": reply_id,
+        "assignment_id": assignment_id,
+        "from_mentor": True,
+        "mentor_id": mentor_id,
+        "mentor_name": mentor_name,
+        "student_id": student_id,
+        "student_name": student_name,
+        "timestamp": str(datetime.now()),
+        "content_type": message.content_type
+    }
+    
+    if message.content_type == "text":
+        reply_info["text"] = message.text
+    elif message.content_type == "photo":
+        reply_info["photo_id"] = message.photo[-1].file_id
+        reply_info["caption"] = message.caption
+    
+    # Сохраняем в истории переписки
+    assignments_data.setdefault("conversations", {})[reply_id] = reply_info
+    
+    if save_assignments(assignments_data):
+        try:
+            # Отправляем ответ ученику
+            if message.content_type == "text":
+                await bot.send_message(
+                    student_id,
+                    f"💬 <b>ОТВЕТ ОТ ВАШЕГО НАСТАВНИКА</b>\n\n"
+                    f"👤 <b>Наставник:</b> {mentor_name}\n\n"
+                    f"{message.text}\n\n"
+                    f"<i>Вы можете продолжить диалог, просто отправляя сообщения сюда</i>"
+                )
+            elif message.content_type == "photo":
+                await bot.send_photo(
+                    student_id,
+                    message.photo[-1].file_id,
+                    caption=f"💬 <b>ОТВЕТ ОТ ВАШЕГО НАСТАВНИКА</b>\n\n"
+                           f"👤 <b>Наставник:</b> {mentor_name}\n\n"
+                           f"{message.caption or ''}\n\n"
+                           f"<i>Вы можете продолжить диалог, просто отправляя сообщения сюда</i>"
+                )
+            
+            # Уведомляем наставника
+            await message.answer(f"✅ Ответ отправлен ученику <b>{student_name}</b>")
+            
+            # Сохраняем состояние для продолжения диалога
+            state = dp.current_state(user=mentor_id, chat=mentor_id)
+            await state.update_data(
+                in_conversation_with=student_id,
+                conversation_assignment=assignment_id
             )
-        elif message.content_type == "photo":
-            await bot.send_photo(
-                student_id,
-                message.photo[-1].file_id,
-                caption=f"💬 <b>Сообщение от наставника {mentor_name}</b>\n\n{message.caption or ''}",
-                reply_markup=kb_receiver,
-                parse_mode="HTML"
-            )
-        elif message.content_type == "document":
-            await bot.send_document(
-                student_id,
-                message.document.file_id,
-                caption=f"💬 <b>Сообщение от наставника {mentor_name}</b>\n\n{message.caption or ''}",
-                reply_markup=kb_receiver,
-                parse_mode="HTML"
-            )
-        elif message.content_type == "voice":
-            await bot.send_voice(
-                student_id,
-                message.voice.file_id,
-                caption=f"💬 <b>Голосовое сообщение от наставника {mentor_name}</b>",
-                reply_markup=kb_receiver,
-                parse_mode="HTML"
-            )
-        
-        # Подтверждение для наставника
-        await message.answer(
-            f"✅ Сообщение отправлено ученику <b>{student_name}</b>",
-            reply_markup=kb_sender
-        )
-        
-    except Exception as e:
-        log_error(f"Ошибка отправки сообщения в диалоге: {e}")
-        await message.answer(f"❌ Ошибка отправки сообщения: {e}")
-
-# --- ЗАВЕРШЕНИЕ ДИАЛОГА ---
-@dp.callback_query_handler(lambda c: c.data == "end_dialogue", state=[DialogueStates.in_dialogue_with_mentor, DialogueStates.in_dialogue_with_student])
-async def end_dialogue_handler(callback: types.CallbackQuery, state):
-    """Завершение диалога"""
-    user_id = str(callback.from_user.id)
+            
+        except Exception as e:
+            log_error(f"Ошибка отправки ответа ученику: {e}")
+            await message.answer(f"❌ Ошибка отправки ответа: {e}")
+    else:
+        await message.answer("❌ Ошибка сохранения ответа")
     
-    # Завершаем диалог в базе данных
-    partner_id = end_dialogue(user_id)
-    
-    if partner_id:
-        # Уведомляем собеседника
-        users_data = load_users()["users"]
-        if user_id in users_data:
-            user_name = f"{users_data[user_id]['name']} {users_data[user_id].get('surname','')}".strip()
-            await bot.send_message(
-                partner_id,
-                f"🚫 <b>Диалог завершен</b>\n\n"
-                f"Собеседник <b>{user_name}</b> завершил диалог.\n"
-                f"Теперь вы можете начать новый диалог или отправить сообщение через меню."
-            )
-    
-    # Сбрасываем состояние
     await state.finish()
-    
-    # Уведомляем пользователя
-    await callback.message.edit_text(
-        f"🚫 <b>Диалог завершен</b>\n\n"
-        f"Вы завершили диалог с собеседником.\n"
-        f"Теперь вы можете начать новый диалог или отправить сообщение через меню."
-    )
-    
-    await callback.answer("Диалог завершен")
 
 # --- ПРОСМОТР ЗАДАНИЯ ---
 @dp.callback_query_handler(lambda c: c.data.startswith("view_assignment:"))
@@ -3783,7 +2747,7 @@ async def check_assignment_status(callback: types.CallbackQuery):
     
     await callback.message.answer(text, parse_mode="HTML")
 
-# --- СТАРЫЙ ОБРАБОТЧИК РАССЫЛКИ (ОСТАВЛЕН ДЛЯ СОВМЕСТИМОСТИ) ---
+# --- ОБЫЧНАЯ РАССЫЛКА ---
 @dp.callback_query_handler(lambda c: c.data == "confirm_send", state=Form.admin_message)
 async def confirm_send(callback, state):
     data = await state.get_data()
@@ -3832,6 +2796,264 @@ async def cancel_send(callback, state):
     await state.finish()
     await admin_main_menu(callback.from_user.id)
 
+# --- НОВЫЙ ОБРАБОТЧИК ЛИЧНЫХ СООБЩЕНИЙ ---
+@dp.message_handler(content_types=types.ContentTypes.ANY, state="*")
+async def handle_private_messages(message: types.Message):
+    """Перехват всех личных сообщений между наставниками и учениками"""
+    # Пропускаем команды
+    if message.text and message.text.startswith('/'):
+        return
+    
+    sender_id = str(message.from_user.id)
+    data = load_users()
+    users = data["users"]
+    
+    # Проверяем, является ли это личным сообщением боту (а не групповым чатом)
+    if str(message.chat.id) != sender_id:
+        return
+    
+    # Получаем состояние пользователя
+    state = dp.current_state(user=message.from_user.id, chat=message.from_user.id)
+    state_data = await state.get_data()
+    
+    # Проверяем, находится ли пользователь в состоянии диалога
+    in_conversation_with = state_data.get("in_conversation_with")
+    
+    if in_conversation_with:
+        # Пользователь уже в диалоге - отправляем сообщение собеседнику
+        receiver_id = in_conversation_with
+        
+        # Проверяем, существует ли получатель
+        if receiver_id not in users:
+            await message.answer("❌ Ошибка: получатель не найден")
+            await state.update_data(in_conversation_with=None)
+            return
+        
+        # Сохраняем сообщение в историю
+        assignment_id = state_data.get("conversation_assignment")
+        is_assignment_related = assignment_id is not None
+        
+        # Сохраняем сообщение
+        if save_conversation_message(
+            from_id=sender_id,
+            to_id=receiver_id,
+            message=message,
+            assignment_id=assignment_id,
+            is_assignment_related=is_assignment_related
+        ):
+            # Пересылаем сообщение получателю
+            try:
+                if message.content_type == "text":
+                    await bot.send_message(
+                        receiver_id,
+                        f"💬 <b>Сообщение от вашего {'наставника' if users[sender_id].get('mentor') == receiver_id else 'ученика'}:</b>\n\n"
+                        f"{message.text}"
+                    )
+                elif message.content_type == "photo":
+                    await bot.send_photo(
+                        receiver_id,
+                        message.photo[-1].file_id,
+                        caption=f"💬 <b>Сообщение от вашего {'наставника' if users[sender_id].get('mentor') == receiver_id else 'ученика'}:</b>\n\n"
+                               f"{message.caption or ''}"
+                    )
+                
+                # Уведомляем отправителя
+                receiver_name = f"{users[receiver_id]['name']} {users[receiver_id].get('surname', '')}".strip()
+                await message.answer(f"✅ Сообщение отправлено <b>{receiver_name}</b>")
+                
+            except Exception as e:
+                log_error(f"Ошибка отправки сообщения: {e}")
+                await message.answer(f"❌ Не удалось отправить сообщение: {e}")
+        else:
+            await message.answer("❌ Ошибка сохранения сообщения")
+        
+        return
+    
+    # Если не в состоянии диалога, проверяем связь наставник-ученик
+    # Ищем, кому пользователь может написать (своим наставникам или ученикам)
+    
+    # Проверяем, является ли пользователь наставником
+    is_mentor = any(u.get("mentor") == sender_id for u in users.values())
+    
+    # Проверяем, есть ли у пользователя наставник
+    has_mentor = users.get(sender_id, {}).get("mentor")
+    
+    if not is_mentor and not has_mentor:
+        # Пользователь не наставник и не имеет наставника - не обрабатываем
+        return
+    
+    # Если это сообщение от ученика к наставнику
+    if has_mentor and message.text and len(message.text) > 10:  # Минимальная длина для обычного сообщения
+        mentor_id = users[sender_id]["mentor"]
+        
+        # Сохраняем сообщение
+        if save_conversation_message(
+            from_id=sender_id,
+            to_id=mentor_id,
+            message=message,
+            assignment_id=None,
+            is_assignment_related=False
+        ):
+            try:
+                # Пересылаем наставнику
+                student_name = f"{users[sender_id]['name']} {users[sender_id].get('surname', '')}".strip()
+                
+                if message.content_type == "text":
+                    await bot.send_message(
+                        mentor_id,
+                        f"💬 <b>Сообщение от вашего ученика {student_name}:</b>\n\n"
+                        f"{message.text}\n\n"
+                        f"<i>Чтобы ответить, просто отправьте сообщение сюда</i>"
+                    )
+                
+                # Уведомляем ученика
+                mentor_name = f"{users[mentor_id]['name']} {users[mentor_id].get('surname', '')}".strip()
+                await message.answer(f"✅ Сообщение отправлено вашему наставнику <b>{mentor_name}</b>")
+                
+                # Устанавливаем состояние диалога для наставника
+                mentor_state = dp.current_state(user=int(mentor_id), chat=int(mentor_id))
+                await mentor_state.update_data(
+                    in_conversation_with=sender_id,
+                    conversation_assignment=None
+                )
+                
+            except Exception as e:
+                log_error(f"Ошибка отправки сообщения наставнику: {e}")
+                await message.answer(f"❌ Не удалось отправить сообщение наставнику: {e}")
+        else:
+            await message.answer("❌ Ошибка сохранения сообщения")
+
+# --- НОВЫЙ ОБРАБОТЧИК: ПРОСМОТР ДИАЛОГА ---
+@dp.callback_query_handler(lambda c: c.data.startswith("view_conversation:"))
+async def view_conversation_handler(callback: types.CallbackQuery):
+    """Просмотр истории переписки с учеником"""
+    student_id = callback.data.split(":")[1]
+    mentor_id = str(callback.from_user.id)
+    
+    # Проверяем, является ли пользователь наставником этого ученика или админом
+    data = load_users()
+    users = data["users"]
+    
+    student = users.get(student_id)
+    if not student:
+        await callback.answer("Ученик не найден", show_alert=True)
+        return
+    
+    is_mentor = student.get("mentor") == mentor_id
+    is_admin = callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]
+    
+    if not is_mentor and not is_admin:
+        await callback.answer("У вас нет доступа к этому диалогу", show_alert=True)
+        return
+    
+    # Получаем историю переписки
+    history = get_conversation_history(mentor_id, student_id, limit=50)
+    
+    if not history:
+        await callback.answer("История переписки пуста", show_alert=True)
+        
+        # Предлагаем начать диалог
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💬 Начать диалог", callback_data=f"start_conversation:{student_id}"))
+        kb.add(InlineKeyboardButton("⬅ Назад", callback_data=f"student_profile:{student_id}:NONE"))
+        
+        await callback.message.answer(
+            f"💬 <b>Диалог с {student['name']}</b>\n\n"
+            f"История переписки пуста.\n"
+            f"Вы можете начать диалог, отправив сообщение.",
+            reply_markup=kb
+        )
+        return
+    
+    # Формируем текст истории
+    student_name = f"{student['name']} {student.get('surname', '')}".strip()
+    mentor_name = f"{users[mentor_id]['name']} {users[mentor_id].get('surname', '')}".strip()
+    
+    text = f"💬 <b>История переписки с {student_name}</b>\n\n"
+    
+    for msg in history:
+        timestamp = msg.get("timestamp", "")
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                time_str = dt.strftime("%d.%m.%Y %H:%M")
+            except:
+                time_str = timestamp[:16]
+        else:
+            time_str = "??"
+        
+        sender_name = msg.get("from_user_name", "?")
+        
+        # Определяем, кто отправитель
+        if msg["from_user_id"] == mentor_id:
+            sender_display = f"<b>👤 Вы ({time_str}):</b>"
+        else:
+            sender_display = f"<b>👤 {sender_name} ({time_str}):</b>"
+        
+        if msg["content_type"] == "text":
+            text += f"{sender_display}\n{msg.get('text', '')}\n\n"
+        elif msg["content_type"] == "photo":
+            caption = msg.get("caption", "")
+            text += f"{sender_display}\n[Фото] {caption}\n\n"
+        elif msg["content_type"] == "document":
+            caption = msg.get("caption", "")
+            text += f"{sender_display}\n[Документ] {caption}\n\n"
+        elif msg["is_assignment_related"]:
+            text += f"{sender_display}\n[Сообщение по заданию]\n\n"
+    
+    # Добавляем инструкцию
+    text += f"\n<i>Чтобы ответить, просто отправьте сообщение в этот чат.</i>"
+    
+    # Кнопки
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("💬 Продолжить диалог", callback_data=f"start_conversation:{student_id}"),
+        InlineKeyboardButton("🔄 Обновить", callback_data=f"view_conversation:{student_id}")
+    )
+    kb.add(InlineKeyboardButton("⬅ Назад", callback_data=f"student_profile:{student_id}:NONE"))
+    
+    # Используем безопасную отправку
+    await safe_send_message(callback.from_user.id, text, reply_markup=kb)
+
+# --- НОВЫЙ ОБРАБОТЧИК: НАЧАТЬ ДИАЛОГ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("start_conversation:"))
+async def start_conversation_handler(callback: types.CallbackQuery):
+    """Начать диалог с учеником"""
+    student_id = callback.data.split(":")[1]
+    mentor_id = str(callback.from_user.id)
+    
+    # Проверяем, является ли пользователь наставником этого ученика
+    data = load_users()
+    users = data["users"]
+    
+    student = users.get(student_id)
+    if not student:
+        await callback.answer("Ученик не найден", show_alert=True)
+        return
+    
+    is_mentor = student.get("mentor") == mentor_id
+    is_admin = callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]
+    
+    if not is_mentor and not is_admin:
+        await callback.answer("У вас нет доступа к диалогу с этим учеником", show_alert=True)
+        return
+    
+    # Устанавливаем состояние диалога
+    state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
+    await state.update_data(
+        in_conversation_with=student_id,
+        conversation_assignment=None
+    )
+    
+    student_name = f"{student['name']} {student.get('surname', '')}".strip()
+    
+    await callback.message.answer(
+        f"💬 <b>Диалог с {student_name}</b>\n\n"
+        f"Теперь все ваши сообщения будут отправляться этому ученику.\n"
+        f"Просто напишите сообщение в этот чат.\n\n"
+        f"<i>Чтобы закончить диалог, используйте команду /menu</i>"
+    )
+
 # --- ЕЖЕДНЕВНЫЙ ОТЧЕТ ---
 async def daily_report():
     await asyncio.sleep(5)
@@ -3867,27 +3089,6 @@ async def daily_report():
         except Exception as e:
             log_info(f"Ошибка отправки отчета: {e}")
 
-# --- ФУНКЦИЯ ДЛЯ АВТОМАТИЧЕСКОЙ ОЧИСТКИ ---
-async def scheduled_cleanup():
-    """Периодическая очистка старых данных"""
-    await asyncio.sleep(60)  # Ждем 1 минуту после запуска
-    while True:
-        try:
-            # Запускаем очистку каждый день в 3:00
-            now = datetime.now()
-            target_time = now.replace(hour=3, minute=0, second=0, microsecond=0)
-            if now > target_time:
-                target_time = target_time.replace(day=now.day + 1)
-            wait_seconds = (target_time - now).total_seconds()
-            await asyncio.sleep(wait_seconds)
-            
-            cleaned_count = cleanup_old_data(days_to_keep=7)
-            log_info(f"🚮 Выполнена плановая очистка: удалено {cleaned_count} старых рассылок")
-            
-        except Exception as e:
-            log_error(f"Ошибка в scheduled_cleanup: {e}")
-            await asyncio.sleep(3600)  # Ждем час при ошибке
-
 # --- RUN ---
 if __name__ == "__main__":
     print("=== Бот запускается ===")
@@ -3917,35 +3118,18 @@ if __name__ == "__main__":
         assignments_count = len(assignments_data.get('assignments', {}))
         solutions_count = len(assignments_data.get('solutions', {}))
         conversations_count = len(assignments_data.get('conversations', {}))
-        active_dialogues_count = len(assignments_data.get('active_dialogues', {}))
         print(f"📚 Загружено заданий: {assignments_count}")
         print(f"📝 Загружено решений: {solutions_count}")
-        print(f"💬 Загружено диалогов: {conversations_count}")
-        print(f"🔗 Активных диалогов: {active_dialogues_count}")
+        print(f"💬 Загружено сообщений: {conversations_count}")
     else:
         print(f"📚 Файл заданий создан")
-    
-    # Загружаем историю рассылок
-    if os.path.exists(BROADCAST_HISTORY_FILE):
-        history = load_broadcast_history()
-        total_broadcasts = history.get("stats", {}).get("total_broadcasts", 0)
-        print(f"📨 Загружено рассылок в истории: {total_broadcasts}")
-    
-    # Выполняем начальную очистку
-    cleaned = cleanup_old_data(days_to_keep=7)
-    if cleaned > 0:
-        print(f"🧹 Очищено старых данных: {cleaned}")
     
     loop = asyncio.get_event_loop()
     loop.run_until_complete(set_bot_commands())
     print("✅ Меню команд настроено")
     
-    # Запускаем фоновые задачи
     loop.create_task(daily_report())
     print("✅ Задача ежедневного отчета запущена")
-    
-    loop.create_task(scheduled_cleanup())
-    print("✅ Задача периодической очистки запущена")
     
     print("="*50)
     print("🚀 Бот запущен и готов к работе!")
@@ -3953,19 +3137,9 @@ if __name__ == "__main__":
     print("🔧 Новые команды для админа: /check_data, /fix_data")
     print("📊 Добавлены функции смены наставника и уровня")
     print("📚 Добавлена система заданий: Ольга/Суперадмин → ученики → наставники")
+    print("💬 ДОБАВЛЕНА СИСТЕМА СОХРАНЕНИЯ ПЕРЕПИСКИ НАСТАВНИКОВ И УЧЕНИКОВ")
+    print("👁️  Админы видят все диалоги наставников с учениками")
     print("🔄 Защита от длинных сообщений добавлена")
-    print("💬 ДОБАВЛЕНА СИСТЕМА НЕПРЕРЫВНЫХ ДИАЛОГОВ:")
-    print("   • Автоматическая пересылка сообщений между учеником и наставником")
-    print("   • Кнопка 'Завершить диалог' для обеих сторон")
-    print("   • Сохранение истории всех сообщений")
-    print("   • Поддержка всех типов контента (текст, фото, документы, голос)")
-    print("="*50)
-    print("🆕 ДОБАВЛЕНЫ НОВЫЕ ФУНКЦИИ:")
-    print("   📊 Детальный отчет по рассылкам с группировкой ошибок")
-    print("   📋 Просмотр полного списка неудачных отправок")
-    print("   🧹 Автоматическая очистка старых данных")
-    print("   📢 Улучшенные уведомления для администратора")
-    print("   🔍 Статистика доставки с типами ошибок")
     print("="*50)
     
     executor.start_polling(dp, skip_updates=True)
