@@ -350,12 +350,28 @@ def get_conversation_history(user1_id, user2_id, limit=50):
     # Фильтруем сообщения между этими пользователями
     history = []
     for msg_id, msg in conversations.items():
-        if (msg["from_user_id"] == user1_id and msg["to_user_id"] == user2_id) or \
-           (msg["from_user_id"] == user2_id and msg["to_user_id"] == user1_id):
+        # Преобразуем ID к строке для сравнения
+        from_id = str(msg.get("from_user_id", ""))
+        to_id = str(msg.get("to_user_id", ""))
+        user1_str = str(user1_id)
+        user2_str = str(user2_id)
+        
+        if (from_id == user1_str and to_id == user2_str) or \
+           (from_id == user2_str and to_id == user1_str):
             history.append(msg)
     
-    # Сортируем по времени (старые сначала)
-    history.sort(key=lambda x: x.get("timestamp", ""))
+    if not history:
+        return []
+    
+    # Сортируем по времени (старые сначала для правильного отображения)
+    try:
+        history.sort(key=lambda x: datetime.fromisoformat(
+            x.get("timestamp", "2000-01-01").replace('Z', '+00:00')
+        ))
+    except Exception as e:
+        log_error(f"Ошибка сортировки истории: {e}")
+        # Если не удалось отсортировать по времени, просто возвращаем
+        pass
     
     # Возвращаем последние N сообщений
     return history[-limit:] if limit > 0 else history
@@ -633,11 +649,18 @@ async def superadmin_view_all_conversations(callback: types.CallbackQuery, conve
     conversation_pairs = {}
     
     for msg_id, msg in conversations.items():
-        from_id = msg["from_user_id"]
-        to_id = msg["to_user_id"]
+        from_id = str(msg.get("from_user_id", ""))
+        to_id = str(msg.get("to_user_id", ""))
+        
+        # Пропускаем сообщения без корректных ID
+        if not from_id or not to_id:
+            continue
+        
+        # Создаем ключ для пары (отсортированный кортеж ID)
         pair_key = tuple(sorted([from_id, to_id]))
         
         if pair_key not in conversation_pairs:
+            # Получаем имена пользователей
             from_user = users_data.get(from_id, {"name": "?", "surname": ""})
             to_user = users_data.get(to_id, {"name": "?", "surname": ""})
             
@@ -656,12 +679,29 @@ async def superadmin_view_all_conversations(callback: types.CallbackQuery, conve
                 "user2_name": to_name,
                 "is_mentor_student": is_mentor_student,
                 "last_message": msg.get("timestamp", ""),
-                "message_count": 0
+                "message_count": 0,
+                "last_message_obj": msg  # Сохраняем последнее сообщение для сортировки
             }
         
+        # Увеличиваем счетчик сообщений
         conversation_pairs[pair_key]["message_count"] += 1
+        
+        # Обновляем время последнего сообщения, если текущее новее
+        current_time = msg.get("timestamp", "")
+        if current_time > conversation_pairs[pair_key]["last_message"]:
+            conversation_pairs[pair_key]["last_message"] = current_time
+            conversation_pairs[pair_key]["last_message_obj"] = msg
     
-    # Сортируем по последнему сообщению (новые сначала)
+    if not conversation_pairs:
+        await callback.message.answer(
+            "💬 <b>Все диалоги в системе</b>\n\n"
+            "Пока нет сохраненных диалогов.\n\n"
+            "<i>Диалоги автоматически сохраняются при общении через бота</i>",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Сортируем по времени последнего сообщения (новые сначала)
     sorted_pairs = sorted(
         conversation_pairs.values(), 
         key=lambda x: x["last_message"], 
@@ -726,8 +766,12 @@ async def admin_view_mentor_conversations(callback: types.CallbackQuery, convers
     conversation_pairs = {}
     
     for msg_id, msg in conversations.items():
-        from_id = msg["from_user_id"]
-        to_id = msg["to_user_id"]
+        from_id = str(msg.get("from_user_id", ""))
+        to_id = str(msg.get("to_user_id", ""))
+        
+        # Пропускаем сообщения без корректных ID
+        if not from_id or not to_id:
+            continue
         
         # Определяем, кто наставник, а кто ученик
         from_user = users_data.get(from_id, {})
@@ -762,10 +806,17 @@ async def admin_view_mentor_conversations(callback: types.CallbackQuery, convers
                 "student_id": student_id,
                 "student_name": student_name,
                 "last_message": msg.get("timestamp", ""),
-                "message_count": 0
+                "message_count": 0,
+                "last_message_obj": msg
             }
         
         conversation_pairs[pair_key]["message_count"] += 1
+        
+        # Обновляем время последнего сообщения
+        current_time = msg.get("timestamp", "")
+        if current_time > conversation_pairs[pair_key]["last_message"]:
+            conversation_pairs[pair_key]["last_message"] = current_time
+            conversation_pairs[pair_key]["last_message_obj"] = msg
     
     if not conversation_pairs:
         await callback.message.answer(
@@ -785,7 +836,7 @@ async def admin_view_mentor_conversations(callback: types.CallbackQuery, convers
     
     text = f"💬 <b>Диалоги наставников с учениками</b>\n\n"
     text += f"Всего диалогов: {len(sorted_pairs)}\n"
-    text += f"Всего сообщений: {len(conversations)}\n\n"
+    text += f"Всего сообщений в диалогах наставников: {sum(p['message_count'] for p in sorted_pairs)}\n\n"
     
     # Показываем первые 10 диалогов
     for i, pair in enumerate(sorted_pairs[:10], 1):
@@ -844,8 +895,12 @@ async def admin_view_mentor_conversations_only_handler(callback: types.CallbackQ
     conversation_pairs = {}
     
     for msg_id, msg in conversations.items():
-        from_id = msg["from_user_id"]
-        to_id = msg["to_user_id"]
+        from_id = str(msg.get("from_user_id", ""))
+        to_id = str(msg.get("to_user_id", ""))
+        
+        # Пропускаем сообщения без корректных ID
+        if not from_id or not to_id:
+            continue
         
         # Определяем, кто наставник, а кто ученик
         from_user = users_data.get(from_id, {})
@@ -880,14 +935,21 @@ async def admin_view_mentor_conversations_only_handler(callback: types.CallbackQ
                 "student_id": student_id,
                 "student_name": student_name,
                 "last_message": msg.get("timestamp", ""),
-                "message_count": 0
+                "message_count": 0,
+                "last_message_obj": msg
             }
         
         conversation_pairs[pair_key]["message_count"] += 1
+        
+        # Обновляем время последнего сообщения
+        current_time = msg.get("timestamp", "")
+        if current_time > conversation_pairs[pair_key]["last_message"]:
+            conversation_pairs[pair_key]["last_message"] = current_time
+            conversation_pairs[pair_key]["last_message_obj"] = msg
     
     if not conversation_pairs:
         await callback.message.answer(
-            "💬 <b>Диалоги наставников с учениками</b>\n\n"
+            "👨‍🏫 <b>Диалоги наставников с учениками</b>\n\n"
             "Пока нет сохраненных диалогов между наставниками и учениками."
         )
         return
@@ -896,7 +958,8 @@ async def admin_view_mentor_conversations_only_handler(callback: types.CallbackQ
     sorted_pairs = sorted(conversation_pairs.values(), key=lambda x: x["last_message"], reverse=True)
     
     text = f"👨‍🏫 <b>Диалоги наставников с учениками</b>\n\n"
-    text += f"Всего диалогов: {len(sorted_pairs)}\n\n"
+    text += f"Всего диалогов: {len(sorted_pairs)}\n"
+    text += f"Всего сообщений: {sum(p['message_count'] for p in sorted_pairs)}\n\n"
     
     for i, pair in enumerate(sorted_pairs[:15], 1):
         timestamp = pair.get("last_message", "")
@@ -914,6 +977,8 @@ async def admin_view_mentor_conversations_only_handler(callback: types.CallbackQ
     
     if len(sorted_pairs) > 15:
         text += f"... и еще {len(sorted_pairs) - 15} диалогов\n"
+    
+    text += "<i>Выберите диалог для просмотра:</i>"
     
     # Кнопки
     kb = InlineKeyboardMarkup(row_width=1)
@@ -974,6 +1039,7 @@ async def superadmin_view_conversation_handler(callback: types.CallbackQuery):
         title = f"💬 Диалог: 👤 {user1_name} ↔ 👤 {user2_name}"
     
     text = f"{title}\n\n"
+    text += f"Всего сообщений: {len(history)}\n\n"
     
     for msg in history:
         timestamp = msg.get("timestamp", "")
@@ -1007,6 +1073,8 @@ async def superadmin_view_conversation_handler(callback: types.CallbackQuery):
             text += f"{sender_display}\n[Документ] {caption}\n\n"
         elif msg["is_assignment_related"]:
             text += f"{sender_display}\n[Сообщение по заданию]\n\n"
+        else:
+            text += f"{sender_display}\n[Сообщение типа: {msg['content_type']}]\n\n"
     
     # Кнопки
     kb = InlineKeyboardMarkup()
@@ -1041,6 +1109,7 @@ async def admin_view_specific_conversation_handler(callback: types.CallbackQuery
     student_name = f"{users_data[student_id]['name']} {users_data[student_id].get('surname', '')}".strip()
     
     text = f"💬 <b>Диалог: {mentor_name} ↔ {student_name}</b>\n\n"
+    text += f"Всего сообщений: {len(history)}\n\n"
     
     for msg in history:
         timestamp = msg.get("timestamp", "")
@@ -1071,6 +1140,8 @@ async def admin_view_specific_conversation_handler(callback: types.CallbackQuery
             text += f"{sender_display}\n[Документ] {caption}\n\n"
         elif msg["is_assignment_related"]:
             text += f"{sender_display}\n[Сообщение по заданию]\n\n"
+        else:
+            text += f"{sender_display}\n[Сообщение типа: {msg['content_type']}]\n\n"
     
     # Кнопки
     kb = InlineKeyboardMarkup()
@@ -1088,17 +1159,27 @@ async def dialogs_command(message: types.Message, state=None):
         await message.answer("⚠️ Эта команда доступна только администраторам")
         return
     
+    log_info(f"Команда /dialogs от пользователя {message.from_user.id}")
+    
     if state:
         await state.finish()
     
-    # Перенаправляем на обработчик просмотра диалогов
-    await admin_view_conversations_handler(types.CallbackQuery(
+    # Проверяем, есть ли сохраненные диалоги
+    assignments_data = load_assignments()
+    conversations_count = len(assignments_data.get("conversations", {}))
+    log_info(f"Всего сохраненных сообщений: {conversations_count}")
+    
+    # Создаем правильный объект CallbackQuery
+    fake_callback = types.CallbackQuery(
         id="dialogs_command",
         from_user=message.from_user,
-        chat_instance="",
+        chat_instance=str(message.chat.id),
         message=message,
         data="admin_view_conversations"
-    ))
+    )
+    
+    # Вызываем обработчик диалогов
+    await admin_view_conversations_handler(fake_callback)
 
 # --- НОВЫЕ КОМАНДЫ ДЛЯ АДМИНА ---
 @dp.message_handler(commands=["check_data"], state="*")
