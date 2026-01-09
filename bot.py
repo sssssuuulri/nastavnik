@@ -376,7 +376,8 @@ async def set_bot_commands():
         types.BotCommand("broadcast", "📢 Рассылка"),
         types.BotCommand("check_data", "🔧 Проверить данные"),
         types.BotCommand("fix_data", "🛠 Исправить данные"),
-        types.BotCommand("register_superadmin", "👑 Зарегистрировать суперадмина")
+        types.BotCommand("register_superadmin", "👑 Зарегистрировать суперадмина"),
+        types.BotCommand("dialogs", "💬 Все диалоги")  # ДОБАВЛЕНА НОВАЯ КОМАНДА
     ]
     
     await bot.set_my_commands(commands)
@@ -461,7 +462,7 @@ async def admin_panel_handler(callback):
         InlineKeyboardButton("🆕 Новые", callback_data="admin_new_today")
     )
     kb.add(
-        InlineKeyboardButton("💬 Все диалоги", callback_data="admin_view_conversations"),
+        InlineKeyboardButton("💬 Все диалоги", callback_data="admin_view_conversations"),  # ДОБАВЛЕНО
         InlineKeyboardButton("🔍 Поиск", callback_data="admin_search")
     )
     
@@ -1073,6 +1074,26 @@ async def admin_view_specific_conversation_handler(callback: types.CallbackQuery
     
     # Используем безопасную отправку
     await safe_send_message(callback.from_user.id, text, reply_markup=kb)
+
+# --- НОВАЯ КОМАНДА /dialogs ДЛЯ ПРОСМОТРА ДИАЛОГОВ ---
+@dp.message_handler(commands=["dialogs"], state="*")
+async def dialogs_command(message: types.Message, state=None):
+    """Команда для просмотра всех диалогов"""
+    if message.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
+        await message.answer("⚠️ Эта команда доступна только администраторам")
+        return
+    
+    if state:
+        await state.finish()
+    
+    # Перенаправляем на обработчик просмотра диалогов
+    await admin_view_conversations_handler(types.CallbackQuery(
+        id="dialogs_command",
+        from_user=message.from_user,
+        chat_instance="",
+        message=message,
+        data="admin_view_conversations"
+    ))
 
 # --- НОВЫЕ КОМАНДЫ ДЛЯ АДМИНА ---
 @dp.message_handler(commands=["check_data"], state="*")
