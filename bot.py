@@ -296,7 +296,7 @@ def save_assignments(data):
         log_error(f"❌ Ошибка сохранения assignments.json: {e}")
         return False
 
-# --- ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ СОХРАНЕНИЯ ПЕРЕПИСКИ ---
+# --- ФУНКЦИИ ДЛЯ СОХРАНЕНИЯ И ПОЛУЧЕНИЯ ПЕРЕПИСКИ ---
 def save_conversation_message(from_id, to_id, message, assignment_id=None, is_assignment_related=False):
     """Сохранение сообщения в историю переписки"""
     assignments_data = load_assignments()
@@ -418,6 +418,7 @@ async def admin_main_menu(user_id):
     kb.add(InlineKeyboardButton("👤 Мой профиль", callback_data="my_profile"))
     kb.add(InlineKeyboardButton("👥 Мои ученики", callback_data="show_my_students"))
     kb.add(InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
+    kb.add(InlineKeyboardButton("💬 Диалоги наставников", callback_data="admin_view_conversations"))
     
     if user_id == YOUR_ADMIN_ID:
         kb.add(InlineKeyboardButton("🌐 Все пользователи", callback_data="all_users"))
@@ -447,11 +448,14 @@ async def admin_panel_handler(callback):
         InlineKeyboardButton("📈 Активность", callback_data="admin_activity"),
         InlineKeyboardButton("🆕 Новые", callback_data="admin_new_today")
     )
+    kb.add(
+        InlineKeyboardButton("💬 Диалоги наставников", callback_data="admin_view_conversations"),
+        InlineKeyboardButton("🔍 Поиск", callback_data="admin_search")
+    )
     
     if callback.from_user.id == YOUR_ADMIN_ID:
         kb.add(
-            InlineKeyboardButton("👥 Все юзеры", callback_data="all_users"),
-            InlineKeyboardButton("🔍 Поиск", callback_data="admin_search")
+            InlineKeyboardButton("👥 Все юзеры", callback_data="all_users")
         )
     
     kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_to_admin_main"))
@@ -568,6 +572,192 @@ async def admin_search(callback):
     await callback.message.answer("🔍 <b>Поиск пользователя</b>\n\nВведите имя, фамилию или ID пользователя:")
     await callback.answer("Функция в разработке", show_alert=True)
 
+# --- НОВЫЙ ОБРАБОТЧИК: ПРОСМОТР ДИАЛОГОВ НАСТАВНИКОВ (для админов) ---
+@dp.callback_query_handler(lambda c: c.data == "admin_view_conversations")
+async def admin_view_conversations_handler(callback: types.CallbackQuery):
+    """Админ просматривает все диалоги наставников с учениками"""
+    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
+        await callback.answer("Доступ только для администраторов", show_alert=True)
+        return
+    
+    # Загружаем данные
+    assignments_data = load_assignments()
+    users_data = load_users()["users"]
+    
+    conversations = assignments_data.get("conversations", {})
+    
+    if not conversations:
+        await callback.message.answer(
+            "💬 <b>Диалоги наставников с учениками</b>\n\n"
+            "Пока нет сохраненных диалогов.\n\n"
+            "<i>Диалоги автоматически сохраняются, когда наставники общаются с учениками через бота</i>",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Группируем диалоги по парам наставник-ученик
+    conversation_pairs = {}
+    
+    for msg_id, msg in conversations.items():
+        pair_key = tuple(sorted([msg["from_user_id"], msg["to_user_id"]]))
+        
+        if pair_key not in conversation_pairs:
+            # Определяем, кто наставник, а кто ученик
+            from_user = users_data.get(msg["from_user_id"], {})
+            to_user = users_data.get(msg["to_user_id"], {})
+            
+            # Проверяем отношения наставник-ученик
+            is_mentor_student_pair = False
+            mentor_id = None
+            student_id = None
+            
+            if from_user.get("mentor") == msg["to_user_id"]:
+                mentor_id = msg["to_user_id"]
+                student_id = msg["from_user_id"]
+                is_mentor_student_pair = True
+            elif to_user.get("mentor") == msg["from_user_id"]:
+                mentor_id = msg["from_user_id"]
+                student_id = msg["to_user_id"]
+                is_mentor_student_pair = True
+            
+            if not is_mentor_student_pair:
+                # Не является отношением наставник-ученик, пропускаем
+                continue
+            
+            mentor_name = f"{users_data[mentor_id]['name']} {users_data[mentor_id].get('surname', '')}".strip()
+            student_name = f"{users_data[student_id]['name']} {users_data[student_id].get('surname', '')}".strip()
+            
+            conversation_pairs[pair_key] = {
+                "mentor_id": mentor_id,
+                "mentor_name": mentor_name,
+                "student_id": student_id,
+                "student_name": student_name,
+                "last_message": msg.get("timestamp", ""),
+                "message_count": 0
+            }
+        
+        conversation_pairs[pair_key]["message_count"] += 1
+    
+    if not conversation_pairs:
+        await callback.message.answer(
+            "💬 <b>Диалоги наставников с учениками</b>\n\n"
+            "Пока нет сохраненных диалогов между наставниками и учениками.\n\n"
+            "<i>Диалоги автоматически сохраняются, когда наставники общаются с учениками через бота</i>",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Сортируем по последнему сообщению (новые сначала)
+    sorted_pairs = sorted(
+        conversation_pairs.values(), 
+        key=lambda x: x["last_message"], 
+        reverse=True
+    )
+    
+    text = f"💬 <b>Диалоги наставников с учениками</b>\n\n"
+    text += f"Всего диалогов: {len(sorted_pairs)}\n"
+    text += f"Всего сообщений: {len(conversations)}\n\n"
+    
+    # Показываем первые 10 диалогов
+    for i, pair in enumerate(sorted_pairs[:10], 1):
+        timestamp = pair.get("last_message", "")
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                time_str = dt.strftime("%d.%m.%Y %H:%M")
+            except:
+                time_str = timestamp[:16]
+        else:
+            time_str = "??"
+        
+        text += f"{i}. 👤 <b>{pair['mentor_name']}</b> → 👨‍🎓 <b>{pair['student_name']}</b>\n"
+        text += f"   📝 Сообщений: {pair['message_count']}\n"
+        text += f"   ⏰ Последнее: {time_str}\n\n"
+    
+    if len(sorted_pairs) > 10:
+        text += f"... и еще {len(sorted_pairs) - 10} диалогов\n\n"
+    
+    text += "<i>Выберите диалог для просмотра:</i>"
+    
+    # Создаем клавиатуру с диалогами
+    kb = InlineKeyboardMarkup(row_width=1)
+    
+    for pair in sorted_pairs[:10]:
+        btn_text = f"💬 {pair['mentor_name']} ↔ {pair['student_name']}"
+        kb.add(InlineKeyboardButton(
+            btn_text[:64],  # Ограничиваем длину текста кнопки
+            callback_data=f"admin_view_specific_conversation:{pair['mentor_id']}:{pair['student_id']}"
+        ))
+    
+    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="admin_view_conversations"))
+    kb.add(InlineKeyboardButton("⬅ Назад", callback_data="admin_panel"))
+    
+    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("admin_view_specific_conversation:"))
+async def admin_view_specific_conversation_handler(callback: types.CallbackQuery):
+    """Админ просматривает конкретный диалог"""
+    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
+        await callback.answer("Доступ только для администраторов", show_alert=True)
+        return
+    
+    parts = callback.data.split(":")
+    mentor_id = parts[1]
+    student_id = parts[2]
+    
+    # Получаем историю переписки
+    history = get_conversation_history(mentor_id, student_id, limit=50)
+    
+    if not history:
+        await callback.answer("История переписки пуста", show_alert=True)
+        return
+    
+    # Загружаем данные пользователей
+    users_data = load_users()["users"]
+    
+    mentor_name = f"{users_data[mentor_id]['name']} {users_data[mentor_id].get('surname', '')}".strip()
+    student_name = f"{users_data[student_id]['name']} {users_data[student_id].get('surname', '')}".strip()
+    
+    text = f"💬 <b>Диалог: {mentor_name} ↔ {student_name}</b>\n\n"
+    
+    for msg in history:
+        timestamp = msg.get("timestamp", "")
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                time_str = dt.strftime("%d.%m.%Y %H:%M")
+            except:
+                time_str = timestamp[:16]
+        else:
+            time_str = "??"
+        
+        sender_name = msg.get("from_user_name", "?")
+        
+        # Определяем, кто отправитель
+        if msg["from_user_id"] == mentor_id:
+            sender_display = f"<b>👤 НАСТАВНИК {sender_name} ({time_str}):</b>"
+        else:
+            sender_display = f"<b>👨‍🎓 УЧЕНИК {sender_name} ({time_str}):</b>"
+        
+        if msg["content_type"] == "text":
+            text += f"{sender_display}\n{msg.get('text', '')}\n\n"
+        elif msg["content_type"] == "photo":
+            caption = msg.get("caption", "")
+            text += f"{sender_display}\n[Фото] {caption}\n\n"
+        elif msg["content_type"] == "document":
+            caption = msg.get("caption", "")
+            text += f"{sender_display}\n[Документ] {caption}\n\n"
+        elif msg["is_assignment_related"]:
+            text += f"{sender_display}\n[Сообщение по заданию]\n\n"
+    
+    # Кнопки
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("⬅ К списку диалогов", callback_data="admin_view_conversations"))
+    kb.add(InlineKeyboardButton("📋 В админ-панель", callback_data="admin_panel"))
+    
+    # Используем безопасную отправку
+    await safe_send_message(callback.from_user.id, text, reply_markup=kb)
+
 # --- НОВЫЕ КОМАНДЫ ДЛЯ АДМИНА ---
 @dp.message_handler(commands=["check_data"], state="*")
 async def check_data_command(message: types.Message, state=None):
@@ -653,8 +843,101 @@ async def mentor_main_menu(user_id):
         kb.add(InlineKeyboardButton("👥 Мои ученики", callback_data="show_my_students"))
         # ДОБАВЛЕНО: Кнопка для просмотра решений учеников
         kb.add(InlineKeyboardButton("📥 Ответы учеников", callback_data="view_student_solutions"))
+        # ДОБАВЛЕНО: Кнопка для просмотра диалогов с учениками
+        kb.add(InlineKeyboardButton("💬 Мои диалоги", callback_data="mentor_view_conversations"))
     
     await bot.send_message(user_id, "📋 <b>Главное меню</b>", reply_markup=kb)
+
+# --- НОВЫЙ ОБРАБОТЧИК: ПРОСМОТР ДИАЛОГОВ НАСТАВНИКА ---
+@dp.callback_query_handler(lambda c: c.data == "mentor_view_conversations")
+async def mentor_view_conversations_handler(callback: types.CallbackQuery):
+    """Наставник просматривает свои диалоги с учениками"""
+    mentor_id = str(callback.from_user.id)
+    
+    # Проверяем, является ли пользователь наставником
+    data = load_users()
+    users = data["users"]
+    
+    # Если пользователь администратор, показываем админ-просмотр диалогов
+    if callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]:
+        await admin_view_conversations_handler(callback)
+        return
+    
+    has_students = any(u.get("mentor") == mentor_id for u in users.values())
+    if not has_students:
+        await callback.answer("У вас пока нет учеников", show_alert=True)
+        return
+    
+    # Загружаем данные переписок
+    assignments_data = load_assignments()
+    conversations = assignments_data.get("conversations", {})
+    
+    # Находим всех учеников наставника
+    students = [uid for uid, u in users.items() if u.get("mentor") == mentor_id]
+    
+    # Собираем диалоги с каждым учеником
+    student_dialogs = []
+    
+    for student_id in students:
+        # Получаем историю переписки с этим учеником
+        history = get_conversation_history(mentor_id, student_id, limit=1)
+        
+        if history:
+            last_message = history[-1]
+            student_name = f"{users[student_id]['name']} {users[student_id].get('surname', '')}".strip()
+            
+            student_dialogs.append({
+                "student_id": student_id,
+                "student_name": student_name,
+                "last_message_time": last_message.get("timestamp", ""),
+                "message_count": len(get_conversation_history(mentor_id, student_id, limit=0))
+            })
+    
+    if not student_dialogs:
+        await callback.message.answer(
+            "💬 <b>Мои диалоги с учениками</b>\n\n"
+            "У вас пока нет сохраненных диалогов с учениками.\n"
+            "Диалоги автоматически сохраняются, когда вы общаетесь с учениками через бота.",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Сортируем по времени последнего сообщения
+    student_dialogs.sort(key=lambda x: x["last_message_time"], reverse=True)
+    
+    text = f"💬 <b>Мои диалоги с учениками</b>\n\n"
+    
+    for i, dialog in enumerate(student_dialogs, 1):
+        timestamp = dialog.get("last_message_time", "")
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                time_str = dt.strftime("%d.%m.%Y %H:%M")
+            except:
+                time_str = timestamp[:16]
+        else:
+            time_str = "??"
+        
+        text += f"{i}. 👨‍🎓 <b>{dialog['student_name']}</b>\n"
+        text += f"   📝 Сообщений: {dialog['message_count']}\n"
+        text += f"   ⏰ Последнее: {time_str}\n\n"
+    
+    text += "<i>Выберите ученика для просмотра диалога:</i>"
+    
+    # Создаем клавиатуру
+    kb = InlineKeyboardMarkup(row_width=1)
+    
+    for dialog in student_dialogs:
+        btn_text = f"💬 {dialog['student_name']} ({dialog['message_count']} сообщ.)"
+        kb.add(InlineKeyboardButton(
+            btn_text[:64],
+            callback_data=f"view_conversation:{dialog['student_id']}"
+        ))
+    
+    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="mentor_view_conversations"))
+    kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_main"))
+    
+    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 # --- КОМАНДЫ МЕНЮ ---
 @dp.message_handler(commands=["help"], state="*")
@@ -687,14 +970,14 @@ async def help_command(message: types.Message, state=None):
 • Изменять свой уровень (требуется подтверждение наставника)
 • Изменять наставника (требуется подтверждение нового наставника)
 • Просматривать решения заданий от своих учеников
-• 💬 Общаться с учениками в личных сообщениях (вся переписка сохраняется)
+• 💬 Просматривать историю диалогов с учениками
 
 <b>Для администраторов:</b>
 • Доступны дополнительные команды (/admin, /stats, /broadcast, /check_data, /fix_data)
 • Управление статистикой и рассылками
 • Проверка и исправление данных
 • Отправка заданий ученикам через рассылку
-• 👁️ Просмотр переписок всех наставников с учениками
+• 👁️ Просмотр всех диалогов наставников с учениками
     """
     await message.answer(help_text)
 
@@ -1759,6 +2042,137 @@ async def branch_level_detail(callback):
     # Используем безопасную отправку
     await safe_send_message(callback.from_user.id, text, reply_markup=kb)
 
+# --- НОВЫЙ ОБРАБОТЧИК: ПРОСМОТР ДИАЛОГА С УЧЕНИКОМ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("view_conversation:"))
+async def view_conversation_handler(callback: types.CallbackQuery):
+    """Просмотр истории переписки с учеником"""
+    student_id = callback.data.split(":")[1]
+    mentor_id = str(callback.from_user.id)
+    
+    # Проверяем, является ли пользователь наставником этого ученика или админом
+    data = load_users()
+    users = data["users"]
+    
+    student = users.get(student_id)
+    if not student:
+        await callback.answer("Ученик не найден", show_alert=True)
+        return
+    
+    is_mentor = student.get("mentor") == mentor_id
+    is_admin = callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]
+    
+    if not is_mentor and not is_admin:
+        await callback.answer("У вас нет доступа к этому диалогу", show_alert=True)
+        return
+    
+    # Получаем историю переписки
+    history = get_conversation_history(mentor_id, student_id, limit=50)
+    
+    if not history:
+        await callback.answer("История переписки пуста", show_alert=True)
+        
+        # Предлагаем начать диалог
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💬 Начать диалог", callback_data=f"start_conversation:{student_id}"))
+        kb.add(InlineKeyboardButton("⬅ Назад", callback_data=f"student_profile:{student_id}:NONE"))
+        
+        await callback.message.answer(
+            f"💬 <b>Диалог с {student['name']}</b>\n\n"
+            f"История переписки пуста.\n"
+            f"Вы можете начать диалог, отправив сообщение ученику через бота.",
+            reply_markup=kb
+        )
+        return
+    
+    # Формируем текст истории
+    student_name = f"{student['name']} {student.get('surname', '')}".strip()
+    mentor_name = f"{users[mentor_id]['name']} {users[mentor_id].get('surname', '')}".strip()
+    
+    text = f"💬 <b>История переписки с {student_name}</b>\n\n"
+    
+    for msg in history:
+        timestamp = msg.get("timestamp", "")
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                time_str = dt.strftime("%d.%m.%Y %H:%M")
+            except:
+                time_str = timestamp[:16]
+        else:
+            time_str = "??"
+        
+        sender_name = msg.get("from_user_name", "?")
+        
+        # Определяем, кто отправитель
+        if msg["from_user_id"] == mentor_id:
+            sender_display = f"<b>👤 Вы ({time_str}):</b>"
+        else:
+            sender_display = f"<b>👤 {sender_name} ({time_str}):</b>"
+        
+        if msg["content_type"] == "text":
+            text += f"{sender_display}\n{msg.get('text', '')}\n\n"
+        elif msg["content_type"] == "photo":
+            caption = msg.get("caption", "")
+            text += f"{sender_display}\n[Фото] {caption}\n\n"
+        elif msg["content_type"] == "document":
+            caption = msg.get("caption", "")
+            text += f"{sender_display}\n[Документ] {caption}\n\n"
+        elif msg["is_assignment_related"]:
+            text += f"{sender_display}\n[Сообщение по заданию]\n\n"
+    
+    # Добавляем инструкцию
+    text += f"\n<i>Диалоги автоматически сохраняются при общении через бота.</i>"
+    
+    # Кнопки
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔄 Обновить", callback_data=f"view_conversation:{student_id}"),
+        InlineKeyboardButton("💬 Начать диалог", callback_data=f"start_conversation:{student_id}")
+    )
+    
+    # Определяем, откуда пришли
+    if is_admin:
+        kb.add(InlineKeyboardButton("⬅ К списку диалогов", callback_data="admin_view_conversations"))
+    else:
+        kb.add(InlineKeyboardButton("⬅ К моим диалогам", callback_data="mentor_view_conversations"))
+    
+    # Используем безопасную отправку
+    await safe_send_message(callback.from_user.id, text, reply_markup=kb)
+
+# --- НОВЫЙ ОБРАБОТЧИК: НАЧАТЬ ДИАЛОГ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("start_conversation:"))
+async def start_conversation_handler(callback: types.CallbackQuery):
+    """Начать диалог с учеником"""
+    student_id = callback.data.split(":")[1]
+    mentor_id = str(callback.from_user.id)
+    
+    # Проверяем, является ли пользователь наставником этого ученика
+    data = load_users()
+    users = data["users"]
+    
+    student = users.get(student_id)
+    if not student:
+        await callback.answer("Ученик не найден", show_alert=True)
+        return
+    
+    is_mentor = student.get("mentor") == mentor_id
+    is_admin = callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]
+    
+    if not is_mentor and not is_admin:
+        await callback.answer("У вас нет доступа к диалогу с этим учеником", show_alert=True)
+        return
+    
+    student_name = f"{student['name']} {student.get('surname', '')}".strip()
+    
+    await callback.message.answer(
+        f"💬 <b>Начать диалог с {student_name}</b>\n\n"
+        f"Диалоги с учениками автоматически сохраняются в следующих случаях:\n"
+        f"1. Когда ученик отправляет решение задания через бота\n"
+        f"2. Когда наставник отвечает на решение ученика\n"
+        f"3. При общении через бота с использованием команд\n\n"
+        f"<i>Для просмотра существующих диалогов используйте кнопку «Мои диалоги» в главном меню</i>"
+    )
+
 @dp.callback_query_handler(lambda c: c.data.startswith("student_profile:"))
 async def student_profile(callback):
     parts = callback.data.split(":")
@@ -1781,13 +2195,9 @@ async def student_profile(callback):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("👥 Его ученики", callback_data=f"child_students:{user_id}"))
     
-    # НОВОЕ: Добавляем кнопку просмотра диалога
+    # ДОБАВЛЯЕМ КНОПКУ ПРОСМОТРА ДИАЛОГА
     current_user_id = str(callback.from_user.id)
-    
-    # Проверяем, является ли текущий пользователь наставником этого ученика
     is_mentor = u.get("mentor") == current_user_id
-    
-    # Проверяем, является ли текущий пользователь админом
     is_admin = callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]
     
     if is_mentor or is_admin:
@@ -2796,264 +3206,6 @@ async def cancel_send(callback, state):
     await state.finish()
     await admin_main_menu(callback.from_user.id)
 
-# --- НОВЫЙ ОБРАБОТЧИК ЛИЧНЫХ СООБЩЕНИЙ ---
-@dp.message_handler(content_types=types.ContentTypes.ANY, state="*")
-async def handle_private_messages(message: types.Message):
-    """Перехват всех личных сообщений между наставниками и учениками"""
-    # Пропускаем команды
-    if message.text and message.text.startswith('/'):
-        return
-    
-    sender_id = str(message.from_user.id)
-    data = load_users()
-    users = data["users"]
-    
-    # Проверяем, является ли это личным сообщением боту (а не групповым чатом)
-    if str(message.chat.id) != sender_id:
-        return
-    
-    # Получаем состояние пользователя
-    state = dp.current_state(user=message.from_user.id, chat=message.from_user.id)
-    state_data = await state.get_data()
-    
-    # Проверяем, находится ли пользователь в состоянии диалога
-    in_conversation_with = state_data.get("in_conversation_with")
-    
-    if in_conversation_with:
-        # Пользователь уже в диалоге - отправляем сообщение собеседнику
-        receiver_id = in_conversation_with
-        
-        # Проверяем, существует ли получатель
-        if receiver_id not in users:
-            await message.answer("❌ Ошибка: получатель не найден")
-            await state.update_data(in_conversation_with=None)
-            return
-        
-        # Сохраняем сообщение в историю
-        assignment_id = state_data.get("conversation_assignment")
-        is_assignment_related = assignment_id is not None
-        
-        # Сохраняем сообщение
-        if save_conversation_message(
-            from_id=sender_id,
-            to_id=receiver_id,
-            message=message,
-            assignment_id=assignment_id,
-            is_assignment_related=is_assignment_related
-        ):
-            # Пересылаем сообщение получателю
-            try:
-                if message.content_type == "text":
-                    await bot.send_message(
-                        receiver_id,
-                        f"💬 <b>Сообщение от вашего {'наставника' if users[sender_id].get('mentor') == receiver_id else 'ученика'}:</b>\n\n"
-                        f"{message.text}"
-                    )
-                elif message.content_type == "photo":
-                    await bot.send_photo(
-                        receiver_id,
-                        message.photo[-1].file_id,
-                        caption=f"💬 <b>Сообщение от вашего {'наставника' if users[sender_id].get('mentor') == receiver_id else 'ученика'}:</b>\n\n"
-                               f"{message.caption or ''}"
-                    )
-                
-                # Уведомляем отправителя
-                receiver_name = f"{users[receiver_id]['name']} {users[receiver_id].get('surname', '')}".strip()
-                await message.answer(f"✅ Сообщение отправлено <b>{receiver_name}</b>")
-                
-            except Exception as e:
-                log_error(f"Ошибка отправки сообщения: {e}")
-                await message.answer(f"❌ Не удалось отправить сообщение: {e}")
-        else:
-            await message.answer("❌ Ошибка сохранения сообщения")
-        
-        return
-    
-    # Если не в состоянии диалога, проверяем связь наставник-ученик
-    # Ищем, кому пользователь может написать (своим наставникам или ученикам)
-    
-    # Проверяем, является ли пользователь наставником
-    is_mentor = any(u.get("mentor") == sender_id for u in users.values())
-    
-    # Проверяем, есть ли у пользователя наставник
-    has_mentor = users.get(sender_id, {}).get("mentor")
-    
-    if not is_mentor and not has_mentor:
-        # Пользователь не наставник и не имеет наставника - не обрабатываем
-        return
-    
-    # Если это сообщение от ученика к наставнику
-    if has_mentor and message.text and len(message.text) > 10:  # Минимальная длина для обычного сообщения
-        mentor_id = users[sender_id]["mentor"]
-        
-        # Сохраняем сообщение
-        if save_conversation_message(
-            from_id=sender_id,
-            to_id=mentor_id,
-            message=message,
-            assignment_id=None,
-            is_assignment_related=False
-        ):
-            try:
-                # Пересылаем наставнику
-                student_name = f"{users[sender_id]['name']} {users[sender_id].get('surname', '')}".strip()
-                
-                if message.content_type == "text":
-                    await bot.send_message(
-                        mentor_id,
-                        f"💬 <b>Сообщение от вашего ученика {student_name}:</b>\n\n"
-                        f"{message.text}\n\n"
-                        f"<i>Чтобы ответить, просто отправьте сообщение сюда</i>"
-                    )
-                
-                # Уведомляем ученика
-                mentor_name = f"{users[mentor_id]['name']} {users[mentor_id].get('surname', '')}".strip()
-                await message.answer(f"✅ Сообщение отправлено вашему наставнику <b>{mentor_name}</b>")
-                
-                # Устанавливаем состояние диалога для наставника
-                mentor_state = dp.current_state(user=int(mentor_id), chat=int(mentor_id))
-                await mentor_state.update_data(
-                    in_conversation_with=sender_id,
-                    conversation_assignment=None
-                )
-                
-            except Exception as e:
-                log_error(f"Ошибка отправки сообщения наставнику: {e}")
-                await message.answer(f"❌ Не удалось отправить сообщение наставнику: {e}")
-        else:
-            await message.answer("❌ Ошибка сохранения сообщения")
-
-# --- НОВЫЙ ОБРАБОТЧИК: ПРОСМОТР ДИАЛОГА ---
-@dp.callback_query_handler(lambda c: c.data.startswith("view_conversation:"))
-async def view_conversation_handler(callback: types.CallbackQuery):
-    """Просмотр истории переписки с учеником"""
-    student_id = callback.data.split(":")[1]
-    mentor_id = str(callback.from_user.id)
-    
-    # Проверяем, является ли пользователь наставником этого ученика или админом
-    data = load_users()
-    users = data["users"]
-    
-    student = users.get(student_id)
-    if not student:
-        await callback.answer("Ученик не найден", show_alert=True)
-        return
-    
-    is_mentor = student.get("mentor") == mentor_id
-    is_admin = callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]
-    
-    if not is_mentor and not is_admin:
-        await callback.answer("У вас нет доступа к этому диалогу", show_alert=True)
-        return
-    
-    # Получаем историю переписки
-    history = get_conversation_history(mentor_id, student_id, limit=50)
-    
-    if not history:
-        await callback.answer("История переписки пуста", show_alert=True)
-        
-        # Предлагаем начать диалог
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("💬 Начать диалог", callback_data=f"start_conversation:{student_id}"))
-        kb.add(InlineKeyboardButton("⬅ Назад", callback_data=f"student_profile:{student_id}:NONE"))
-        
-        await callback.message.answer(
-            f"💬 <b>Диалог с {student['name']}</b>\n\n"
-            f"История переписки пуста.\n"
-            f"Вы можете начать диалог, отправив сообщение.",
-            reply_markup=kb
-        )
-        return
-    
-    # Формируем текст истории
-    student_name = f"{student['name']} {student.get('surname', '')}".strip()
-    mentor_name = f"{users[mentor_id]['name']} {users[mentor_id].get('surname', '')}".strip()
-    
-    text = f"💬 <b>История переписки с {student_name}</b>\n\n"
-    
-    for msg in history:
-        timestamp = msg.get("timestamp", "")
-        if timestamp:
-            try:
-                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                time_str = dt.strftime("%d.%m.%Y %H:%M")
-            except:
-                time_str = timestamp[:16]
-        else:
-            time_str = "??"
-        
-        sender_name = msg.get("from_user_name", "?")
-        
-        # Определяем, кто отправитель
-        if msg["from_user_id"] == mentor_id:
-            sender_display = f"<b>👤 Вы ({time_str}):</b>"
-        else:
-            sender_display = f"<b>👤 {sender_name} ({time_str}):</b>"
-        
-        if msg["content_type"] == "text":
-            text += f"{sender_display}\n{msg.get('text', '')}\n\n"
-        elif msg["content_type"] == "photo":
-            caption = msg.get("caption", "")
-            text += f"{sender_display}\n[Фото] {caption}\n\n"
-        elif msg["content_type"] == "document":
-            caption = msg.get("caption", "")
-            text += f"{sender_display}\n[Документ] {caption}\n\n"
-        elif msg["is_assignment_related"]:
-            text += f"{sender_display}\n[Сообщение по заданию]\n\n"
-    
-    # Добавляем инструкцию
-    text += f"\n<i>Чтобы ответить, просто отправьте сообщение в этот чат.</i>"
-    
-    # Кнопки
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("💬 Продолжить диалог", callback_data=f"start_conversation:{student_id}"),
-        InlineKeyboardButton("🔄 Обновить", callback_data=f"view_conversation:{student_id}")
-    )
-    kb.add(InlineKeyboardButton("⬅ Назад", callback_data=f"student_profile:{student_id}:NONE"))
-    
-    # Используем безопасную отправку
-    await safe_send_message(callback.from_user.id, text, reply_markup=kb)
-
-# --- НОВЫЙ ОБРАБОТЧИК: НАЧАТЬ ДИАЛОГ ---
-@dp.callback_query_handler(lambda c: c.data.startswith("start_conversation:"))
-async def start_conversation_handler(callback: types.CallbackQuery):
-    """Начать диалог с учеником"""
-    student_id = callback.data.split(":")[1]
-    mentor_id = str(callback.from_user.id)
-    
-    # Проверяем, является ли пользователь наставником этого ученика
-    data = load_users()
-    users = data["users"]
-    
-    student = users.get(student_id)
-    if not student:
-        await callback.answer("Ученик не найден", show_alert=True)
-        return
-    
-    is_mentor = student.get("mentor") == mentor_id
-    is_admin = callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]
-    
-    if not is_mentor and not is_admin:
-        await callback.answer("У вас нет доступа к диалогу с этим учеником", show_alert=True)
-        return
-    
-    # Устанавливаем состояние диалога
-    state = dp.current_state(user=callback.from_user.id, chat=callback.from_user.id)
-    await state.update_data(
-        in_conversation_with=student_id,
-        conversation_assignment=None
-    )
-    
-    student_name = f"{student['name']} {student.get('surname', '')}".strip()
-    
-    await callback.message.answer(
-        f"💬 <b>Диалог с {student_name}</b>\n\n"
-        f"Теперь все ваши сообщения будут отправляться этому ученику.\n"
-        f"Просто напишите сообщение в этот чат.\n\n"
-        f"<i>Чтобы закончить диалог, используйте команду /menu</i>"
-    )
-
 # --- ЕЖЕДНЕВНЫЙ ОТЧЕТ ---
 async def daily_report():
     await asyncio.sleep(5)
@@ -3137,8 +3289,10 @@ if __name__ == "__main__":
     print("🔧 Новые команды для админа: /check_data, /fix_data")
     print("📊 Добавлены функции смены наставника и уровня")
     print("📚 Добавлена система заданий: Ольга/Суперадмин → ученики → наставники")
-    print("💬 ДОБАВЛЕНА СИСТЕМА СОХРАНЕНИЯ ПЕРЕПИСКИ НАСТАВНИКОВ И УЧЕНИКОВ")
-    print("👁️  Админы видят все диалоги наставников с учениками")
+    print("💬 ДОБАВЛЕНА СИСТЕМА ПРОСМОТРА ДИАЛОГОВ:")
+    print("   • Наставники видят свои диалоги с учениками")
+    print("   • Админы видят ВСЕ диалоги наставников с учениками")
+    print("   • Диалоги автоматически сохраняются при общении через бота")
     print("🔄 Защита от длинных сообщений добавлена")
     print("="*50)
     
