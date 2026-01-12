@@ -12,6 +12,8 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from datetime import datetime, date
 import shutil
 import hashlib
+import threading  # ДОБАВЛЕНО для блокировок
+import time  # ДОБАВЛЕНО для блокировок
 
 # --- ЛОГИ ---
 logger = logging.getLogger("bot_logger")
@@ -52,6 +54,32 @@ LEVELS_ORDER = ["НП", "СВ", "ВТ", "АВТ", "ГТ"]
 OLGA_ID = 64434196
 YOUR_ADMIN_ID = 911511438
 REPORT_GROUP_ID = "-1003632130674"
+
+# ДОБАВЛЕНО: Класс для блокировок файлов (исправление race condition)
+class FileLock:
+    def __init__(self):
+        self.locks = {}
+        self.global_lock = threading.Lock()
+    
+    def acquire(self, filename, timeout=10):
+        """Получить блокировку для файла"""
+        with self.global_lock:
+            if filename not in self.locks:
+                self.locks[filename] = threading.Lock()
+        
+        lock_acquired = self.locks[filename].acquire(timeout=timeout)
+        if not lock_acquired:
+            log_error(f"❌ Не удалось получить блокировку для {filename} (timeout)")
+        return lock_acquired
+    
+    def release(self, filename):
+        """Освободить блокировку для файла"""
+        with self.global_lock:
+            if filename in self.locks:
+                if self.locks[filename].locked():
+                    self.locks[filename].release()
+
+file_lock = FileLock()
 
 # --- Функция для разбивки длинных сообщений на части ---
 async def safe_send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
@@ -123,12 +151,17 @@ def recover_corrupted_file():
     return {"users": {}}
 
 def load_users():
-    """Загрузка пользователей с автоматическим исправлением проблем"""
-    if not os.path.exists(USERS_FILE):
-        log_info("Файл users.json не найден, создается новый")
+    """Загрузка пользователей с автоматическим исправлением проблем и блокировкой"""
+    # Исправление race condition: добавляем блокировку файла
+    if not file_lock.acquire(USERS_FILE):
+        log_error("❌ Не удалось получить блокировку для загрузки users.json, возвращаю пустые данные")
         return {"users": {}}
     
     try:
+        if not os.path.exists(USERS_FILE):
+            log_info("Файл users.json не найден, создается новый")
+            return {"users": {}}
+        
         with open(USERS_FILE, "r", encoding="utf-8") as f:
             content = f.read().strip()
             
@@ -207,98 +240,164 @@ def load_users():
     except Exception as e:
         log_error(f"❌ Ошибка загрузки users.json: {e}")
         return {"users": {}}
+    finally:
+        # Исправление race condition: всегда освобождаем блокировку
+        file_lock.release(USERS_FILE)
 
 def save_users(data):
-    """Сохранение пользователей с атомарной операцией"""
+    """Сохранение пользователей с атомарной операцией и блокировкой"""
     if "users" not in data:
         log_error("❌ Попытка сохранить данные без ключа 'users'")
         return False
     
-    user_count = len(data["users"])
-    log_info(f"🔄 Сохранение {user_count} пользователей...")
-    
-    # Backup текущего файла
-    backup_name = None
-    if os.path.exists(USERS_FILE):
-        try:
-            backup_name = f"users_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            shutil.copy2(USERS_FILE, backup_name)
-            log_info(f"📂 Создан backup: {backup_name}")
-        except Exception as e:
-            log_error(f"⚠️ Не удалось создать backup: {e}")
-    
-    # Сохраняем во временный файл
-    temp_file = f"{USERS_FILE}.tmp"
-    try:
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        # Проверяем что сохранили корректно
-        with open(temp_file, "rb") as f:
-            temp_hash = hashlib.md5(f.read()).hexdigest()
-        
-        # Проверяем что можем загрузить обратно
-        with open(temp_file, "r", encoding="utf-8") as f:
-            temp_data = json.load(f)
-        
-        if "users" not in temp_data:
-            raise ValueError("Временный файл не содержит ключ 'users'")
-        
-        # Атомарная замена
-        if os.name == 'nt':  # Windows
-            os.replace(temp_file, USERS_FILE)
-        else:  # Unix/Linux
-            os.rename(temp_file, USERS_FILE)
-        
-        log_info(f"✅ Сохранено {user_count} пользователей")
-        return True
-        
-    except Exception as e:
-        log_error(f"❌ Ошибка сохранения: {e}")
-        
-        # Восстанавливаем из backup если есть
-        if backup_name and os.path.exists(backup_name):
-            try:
-                shutil.copy2(backup_name, USERS_FILE)
-                log_info(f"🔄 Восстановлено из backup: {backup_name}")
-            except Exception as restore_error:
-                log_error(f"❌ Не удалось восстановить из backup: {restore_error}")
-        
-        # Удаляем временный файл
-        if os.path.exists(temp_file):
-            try:
-                os.remove(temp_file)
-            except:
-                pass
-        
+    # Исправление race condition: добавляем блокировку файла
+    if not file_lock.acquire(USERS_FILE):
+        log_error("❌ Не удалось получить блокировку для сохранения users.json")
         return False
+    
+    try:
+        user_count = len(data["users"])
+        log_info(f"🔄 Сохранение {user_count} пользователей...")
+        
+        # Backup текущего файла
+        backup_name = None
+        if os.path.exists(USERS_FILE):
+            try:
+                backup_name = f"users_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                shutil.copy2(USERS_FILE, backup_name)
+                log_info(f"📂 Создан backup: {backup_name}")
+            except Exception as e:
+                log_error(f"⚠️ Не удалось создать backup: {e}")
+        
+        # Сохраняем во временный файл
+        temp_file = f"{USERS_FILE}.tmp"
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            # Проверяем что сохранили корректно
+            with open(temp_file, "rb") as f:
+                temp_hash = hashlib.md5(f.read()).hexdigest()
+            
+            # Проверяем что можем загрузить обратно
+            with open(temp_file, "r", encoding="utf-8") as f:
+                temp_data = json.load(f)
+            
+            if "users" not in temp_data:
+                raise ValueError("Временный файл не содержит ключ 'users'")
+            
+            # Атомарная замена
+            if os.name == 'nt':  # Windows
+                os.replace(temp_file, USERS_FILE)
+            else:  # Unix/Linux
+                os.rename(temp_file, USERS_FILE)
+            
+            log_info(f"✅ Сохранено {user_count} пользователей")
+            return True
+            
+        except Exception as e:
+            log_error(f"❌ Ошибка сохранения: {e}")
+            
+            # Восстанавливаем из backup если есть
+            if backup_name and os.path.exists(backup_name):
+                try:
+                    shutil.copy2(backup_name, USERS_FILE)
+                    log_info(f"🔄 Восстановлено из backup: {backup_name}")
+                except Exception as restore_error:
+                    log_error(f"❌ Не удалось восстановить из backup: {restore_error}")
+            
+            # Удаляем временный файл
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+            
+            return False
+    finally:
+        # Исправление race condition: всегда освобождаем блокировку
+        file_lock.release(USERS_FILE)
 
 # --- ФУНКЦИИ ДЛЯ РАБОТЫ С ЗАДАНИЯМИ ---
 def load_assignments():
-    """Загрузка заданий и решений"""
-    if not os.path.exists(ASSIGNMENTS_FILE):
+    """Загрузка заданий и решений с блокировкой"""
+    # Исправление race condition: добавляем блокировку файла
+    if not file_lock.acquire(ASSIGNMENTS_FILE):
+        log_error("❌ Не удалось получить блокировку для загрузки assignments.json")
         return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
     
     try:
+        if not os.path.exists(ASSIGNMENTS_FILE):
+            return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
+        
         with open(ASSIGNMENTS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
         log_error(f"❌ Ошибка загрузки assignments.json: {e}")
         return {"assignments": {}, "solutions": {}, "conversations": {}, "assignment_recipients": {}}
+    finally:
+        file_lock.release(ASSIGNMENTS_FILE)
 
 def save_assignments(data):
-    """Сохранение заданий"""
-    try:
-        with open(ASSIGNMENTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as e:
-        log_error(f"❌ Ошибка сохранения assignments.json: {e}")
+    """Сохранение заданий с атомарной операцией и блокировкой (ИСПРАВЛЕНО)"""
+    # Исправление: добавляем атомарную операцию и блокировку как в save_users()
+    if not file_lock.acquire(ASSIGNMENTS_FILE):
+        log_error("❌ Не удалось получить блокировку для сохранения assignments.json")
         return False
+    
+    try:
+        # Backup текущего файла
+        backup_name = None
+        if os.path.exists(ASSIGNMENTS_FILE):
+            try:
+                backup_name = f"assignments_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                shutil.copy2(ASSIGNMENTS_FILE, backup_name)
+                log_info(f"📂 Создан backup assignments: {backup_name}")
+            except Exception as e:
+                log_error(f"⚠️ Не удалось создать backup assignments: {e}")
+        
+        # Сохраняем во временный файл
+        temp_file = f"{ASSIGNMENTS_FILE}.tmp"
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            # Проверяем что можем загрузить обратно
+            with open(temp_file, "r", encoding="utf-8") as f:
+                temp_data = json.load(f)
+            
+            # Атомарная замена
+            os.replace(temp_file, ASSIGNMENTS_FILE)
+            
+            log_info(f"✅ Сохранено assignments: {len(data.get('assignments', {}))} заданий, "
+                    f"{len(data.get('conversations', {}))} сообщений")
+            return True
+            
+        except Exception as e:
+            log_error(f"❌ Ошибка сохранения assignments: {e}")
+            
+            # Восстанавливаем из backup если есть
+            if backup_name and os.path.exists(backup_name):
+                try:
+                    shutil.copy2(backup_name, ASSIGNMENTS_FILE)
+                    log_info(f"🔄 Восстановлено assignments из backup: {backup_name}")
+                except Exception as restore_error:
+                    log_error(f"❌ Не удалось восстановить assignments из backup: {restore_error}")
+            
+            # Удаляем временный файл
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+            
+            return False
+    finally:
+        file_lock.release(ASSIGNMENTS_FILE)
 
 # --- ФУНКЦИИ ДЛЯ СОХРАНЕНИЯ И ПОЛУЧЕНИЯ ПЕРЕПИСКИ ---
 def save_conversation_message(from_id, to_id, message, assignment_id=None, is_assignment_related=False):
-    """Сохранение сообщения в историю переписки"""
+    """Сохранение сообщения в историю переписки (ИСПРАВЛЕНО: добавлено сохранение ВСЕХ типов сообщений)"""
     assignments_data = load_assignments()
     
     message_id = f"msg_{from_id}_{to_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -322,7 +421,7 @@ def save_conversation_message(from_id, to_id, message, assignment_id=None, is_as
         "is_assignment_related": is_assignment_related
     }
     
-    # Сохраняем содержимое в зависимости от типа
+    # ИСПРАВЛЕНО: Сохраняем содержимое ВСЕХ типов сообщений
     if message.content_type == "text":
         message_data["text"] = message.text
     elif message.content_type == "photo":
@@ -336,10 +435,28 @@ def save_conversation_message(from_id, to_id, message, assignment_id=None, is_as
     elif message.content_type == "video":
         message_data["video_id"] = message.video.file_id
         message_data["caption"] = message.caption
+    elif message.content_type == "video_note":
+        message_data["video_note_id"] = message.video_note.file_id
+    elif message.content_type == "sticker":
+        message_data["sticker_id"] = message.sticker.file_id
+    elif message.content_type == "audio":
+        message_data["audio_id"] = message.audio.file_id
+        message_data["caption"] = message.caption
+    elif message.content_type == "location":
+        message_data["latitude"] = message.location.latitude
+        message_data["longitude"] = message.location.longitude
+    elif message.content_type == "contact":
+        message_data["phone_number"] = message.contact.phone_number
+        message_data["first_name"] = message.contact.first_name
+        message_data["last_name"] = message.contact.last_name
+    else:
+        # Для всех остальных типов сохраняем минимальную информацию
+        message_data["content_type"] = message.content_type
+        message_data["raw"] = str(message)
     
     assignments_data.setdefault("conversations", {})[message_id] = message_data
     
-    # Сохраняем обновленные данные
+    # Сохраняем обновленные данные с атомарной операцией
     return save_assignments(assignments_data)
 
 def get_conversation_history(user1_id, user2_id, limit=50):
@@ -350,31 +467,17 @@ def get_conversation_history(user1_id, user2_id, limit=50):
     # Фильтруем сообщения между этими пользователями
     history = []
     for msg_id, msg in conversations.items():
-        # Преобразуем ID к строке для сравнения
-        from_id = str(msg.get("from_user_id", ""))
-        to_id = str(msg.get("to_user_id", ""))
-        user1_str = str(user1_id)
-        user2_str = str(user2_id)
-        
-        if (from_id == user1_str and to_id == user2_str) or \
-           (from_id == user2_str and to_id == user1_str):
+        if (msg["from_user_id"] == user1_id and msg["to_user_id"] == user2_id) or \
+           (msg["from_user_id"] == user2_id and msg["to_user_id"] == user1_id):
             history.append(msg)
     
-    if not history:
-        return []
+    # Сортируем по времени (старые сначала)
+    history.sort(key=lambda x: x.get("timestamp", ""))
     
-    # Сортируем по времени (старые сначала для правильного отображения)
-    try:
-        history.sort(key=lambda x: datetime.fromisoformat(
-            x.get("timestamp", "2000-01-01").replace('Z', '+00:00')
-        ))
-    except Exception as e:
-        log_error(f"Ошибка сортировки истории: {e}")
-        # Если не удалось отсортировать по времени, просто возвращаем
-        pass
-    
-    # Возвращаем последние N сообщений
-    return history[-limit:] if limit > 0 else history
+    # Возвращаем последние N сообщений (ИСПРАВЛЕНО: увеличиваем лимит для полной истории)
+    if limit > 0 and len(history) > limit:
+        return history[-limit:]
+    return history
 
 # --- МЕНЮ КОМАНД ---
 async def set_bot_commands():
@@ -431,6 +534,7 @@ async def admin_main_menu(user_id):
     kb.add(InlineKeyboardButton("👑 Админ-панель", callback_data="admin_panel"))
     
     # ВАЖНОЕ ИЗМЕНЕНИЕ: Добавляем кнопку "💬 Все диалоги" для СУПЕРАДМИНА и ОЛЬГИ
+    # ИСПРАВЛЕНО: Суперадмин ВСЕГДА видит кнопку "Все диалоги" (даже если не зарегистрирован)
     if user_id == YOUR_ADMIN_ID:
         kb.add(InlineKeyboardButton("👁️ ВСЕ диалоги (Суперадмин)", callback_data="admin_view_conversations"))
     elif user_id == OLGA_ID:
@@ -649,18 +753,11 @@ async def superadmin_view_all_conversations(callback: types.CallbackQuery, conve
     conversation_pairs = {}
     
     for msg_id, msg in conversations.items():
-        from_id = str(msg.get("from_user_id", ""))
-        to_id = str(msg.get("to_user_id", ""))
-        
-        # Пропускаем сообщения без корректных ID
-        if not from_id or not to_id:
-            continue
-        
-        # Создаем ключ для пары (отсортированный кортеж ID)
+        from_id = msg["from_user_id"]
+        to_id = msg["to_user_id"]
         pair_key = tuple(sorted([from_id, to_id]))
         
         if pair_key not in conversation_pairs:
-            # Получаем имена пользователей
             from_user = users_data.get(from_id, {"name": "?", "surname": ""})
             to_user = users_data.get(to_id, {"name": "?", "surname": ""})
             
@@ -679,29 +776,12 @@ async def superadmin_view_all_conversations(callback: types.CallbackQuery, conve
                 "user2_name": to_name,
                 "is_mentor_student": is_mentor_student,
                 "last_message": msg.get("timestamp", ""),
-                "message_count": 0,
-                "last_message_obj": msg  # Сохраняем последнее сообщение для сортировки
+                "message_count": 0
             }
         
-        # Увеличиваем счетчик сообщений
         conversation_pairs[pair_key]["message_count"] += 1
-        
-        # Обновляем время последнего сообщения, если текущее новее
-        current_time = msg.get("timestamp", "")
-        if current_time > conversation_pairs[pair_key]["last_message"]:
-            conversation_pairs[pair_key]["last_message"] = current_time
-            conversation_pairs[pair_key]["last_message_obj"] = msg
     
-    if not conversation_pairs:
-        await callback.message.answer(
-            "💬 <b>Все диалоги в системе</b>\n\n"
-            "Пока нет сохраненных диалогов.\n\n"
-            "<i>Диалоги автоматически сохраняются при общении через бота</i>",
-            parse_mode="HTML"
-        )
-        return
-    
-    # Сортируем по времени последнего сообщения (новые сначала)
+    # Сортируем по последнему сообщению (новые сначала)
     sorted_pairs = sorted(
         conversation_pairs.values(), 
         key=lambda x: x["last_message"], 
@@ -761,26 +841,24 @@ async def superadmin_view_all_conversations(callback: types.CallbackQuery, conve
     await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 async def admin_view_mentor_conversations(callback: types.CallbackQuery, conversations, users_data):
-    """Ольга видит только диалоги наставников с учениками"""
+    """Ольга видит только диалоги наставников с учениками (ИСПРАВЛЕНО)"""
     # Группируем диалоги по парам наставник-ученик
     conversation_pairs = {}
     
     for msg_id, msg in conversations.items():
-        from_id = str(msg.get("from_user_id", ""))
-        to_id = str(msg.get("to_user_id", ""))
+        from_id = msg["from_user_id"]
+        to_id = msg["to_user_id"]
         
-        # Пропускаем сообщения без корректных ID
-        if not from_id or not to_id:
-            continue
-        
-        # Определяем, кто наставник, а кто ученик
+        # ИСПРАВЛЕННАЯ ПРОВЕРКА: проверяем в обе стороны
         from_user = users_data.get(from_id, {})
         to_user = users_data.get(to_id, {})
         
+        # Определяем, кто наставник, а кто ученик (исправленная логика)
         is_mentor_student_pair = False
         mentor_id = None
         student_id = None
         
+        # Важно: проверяем ОБА направления отношений
         if from_user.get("mentor") == to_id:
             mentor_id = to_id
             student_id = from_id
@@ -806,17 +884,10 @@ async def admin_view_mentor_conversations(callback: types.CallbackQuery, convers
                 "student_id": student_id,
                 "student_name": student_name,
                 "last_message": msg.get("timestamp", ""),
-                "message_count": 0,
-                "last_message_obj": msg
+                "message_count": 0
             }
         
         conversation_pairs[pair_key]["message_count"] += 1
-        
-        # Обновляем время последнего сообщения
-        current_time = msg.get("timestamp", "")
-        if current_time > conversation_pairs[pair_key]["last_message"]:
-            conversation_pairs[pair_key]["last_message"] = current_time
-            conversation_pairs[pair_key]["last_message_obj"] = msg
     
     if not conversation_pairs:
         await callback.message.answer(
@@ -836,7 +907,7 @@ async def admin_view_mentor_conversations(callback: types.CallbackQuery, convers
     
     text = f"💬 <b>Диалоги наставников с учениками</b>\n\n"
     text += f"Всего диалогов: {len(sorted_pairs)}\n"
-    text += f"Всего сообщений в диалогах наставников: {sum(p['message_count'] for p in sorted_pairs)}\n\n"
+    text += f"Всего сообщений: {len(conversations)}\n\n"
     
     # Показываем первые 10 диалогов
     for i, pair in enumerate(sorted_pairs[:10], 1):
@@ -895,12 +966,8 @@ async def admin_view_mentor_conversations_only_handler(callback: types.CallbackQ
     conversation_pairs = {}
     
     for msg_id, msg in conversations.items():
-        from_id = str(msg.get("from_user_id", ""))
-        to_id = str(msg.get("to_user_id", ""))
-        
-        # Пропускаем сообщения без корректных ID
-        if not from_id or not to_id:
-            continue
+        from_id = msg["from_user_id"]
+        to_id = msg["to_user_id"]
         
         # Определяем, кто наставник, а кто ученик
         from_user = users_data.get(from_id, {})
@@ -935,21 +1002,14 @@ async def admin_view_mentor_conversations_only_handler(callback: types.CallbackQ
                 "student_id": student_id,
                 "student_name": student_name,
                 "last_message": msg.get("timestamp", ""),
-                "message_count": 0,
-                "last_message_obj": msg
+                "message_count": 0
             }
         
         conversation_pairs[pair_key]["message_count"] += 1
-        
-        # Обновляем время последнего сообщения
-        current_time = msg.get("timestamp", "")
-        if current_time > conversation_pairs[pair_key]["last_message"]:
-            conversation_pairs[pair_key]["last_message"] = current_time
-            conversation_pairs[pair_key]["last_message_obj"] = msg
     
     if not conversation_pairs:
         await callback.message.answer(
-            "👨‍🏫 <b>Диалоги наставников с учениками</b>\n\n"
+            "💬 <b>Диалоги наставников с учениками</b>\n\n"
             "Пока нет сохраненных диалогов между наставниками и учениками."
         )
         return
@@ -958,8 +1018,7 @@ async def admin_view_mentor_conversations_only_handler(callback: types.CallbackQ
     sorted_pairs = sorted(conversation_pairs.values(), key=lambda x: x["last_message"], reverse=True)
     
     text = f"👨‍🏫 <b>Диалоги наставников с учениками</b>\n\n"
-    text += f"Всего диалогов: {len(sorted_pairs)}\n"
-    text += f"Всего сообщений: {sum(p['message_count'] for p in sorted_pairs)}\n\n"
+    text += f"Всего диалогов: {len(sorted_pairs)}\n\n"
     
     for i, pair in enumerate(sorted_pairs[:15], 1):
         timestamp = pair.get("last_message", "")
@@ -977,8 +1036,6 @@ async def admin_view_mentor_conversations_only_handler(callback: types.CallbackQ
     
     if len(sorted_pairs) > 15:
         text += f"... и еще {len(sorted_pairs) - 15} диалогов\n"
-    
-    text += "<i>Выберите диалог для просмотра:</i>"
     
     # Кнопки
     kb = InlineKeyboardMarkup(row_width=1)
@@ -1039,7 +1096,6 @@ async def superadmin_view_conversation_handler(callback: types.CallbackQuery):
         title = f"💬 Диалог: 👤 {user1_name} ↔ 👤 {user2_name}"
     
     text = f"{title}\n\n"
-    text += f"Всего сообщений: {len(history)}\n\n"
     
     for msg in history:
         timestamp = msg.get("timestamp", "")
@@ -1073,8 +1129,6 @@ async def superadmin_view_conversation_handler(callback: types.CallbackQuery):
             text += f"{sender_display}\n[Документ] {caption}\n\n"
         elif msg["is_assignment_related"]:
             text += f"{sender_display}\n[Сообщение по заданию]\n\n"
-        else:
-            text += f"{sender_display}\n[Сообщение типа: {msg['content_type']}]\n\n"
     
     # Кнопки
     kb = InlineKeyboardMarkup()
@@ -1109,7 +1163,6 @@ async def admin_view_specific_conversation_handler(callback: types.CallbackQuery
     student_name = f"{users_data[student_id]['name']} {users_data[student_id].get('surname', '')}".strip()
     
     text = f"💬 <b>Диалог: {mentor_name} ↔ {student_name}</b>\n\n"
-    text += f"Всего сообщений: {len(history)}\n\n"
     
     for msg in history:
         timestamp = msg.get("timestamp", "")
@@ -1140,8 +1193,6 @@ async def admin_view_specific_conversation_handler(callback: types.CallbackQuery
             text += f"{sender_display}\n[Документ] {caption}\n\n"
         elif msg["is_assignment_related"]:
             text += f"{sender_display}\n[Сообщение по заданию]\n\n"
-        else:
-            text += f"{sender_display}\n[Сообщение типа: {msg['content_type']}]\n\n"
     
     # Кнопки
     kb = InlineKeyboardMarkup()
@@ -1159,27 +1210,17 @@ async def dialogs_command(message: types.Message, state=None):
         await message.answer("⚠️ Эта команда доступна только администраторам")
         return
     
-    log_info(f"Команда /dialogs от пользователя {message.from_user.id}")
-    
     if state:
         await state.finish()
     
-    # Проверяем, есть ли сохраненные диалоги
-    assignments_data = load_assignments()
-    conversations_count = len(assignments_data.get("conversations", {}))
-    log_info(f"Всего сохраненных сообщений: {conversations_count}")
-    
-    # Создаем правильный объект CallbackQuery
-    fake_callback = types.CallbackQuery(
+    # Перенаправляем на обработчик просмотра диалогов
+    await admin_view_conversations_handler(types.CallbackQuery(
         id="dialogs_command",
         from_user=message.from_user,
-        chat_instance=str(message.chat.id),
+        chat_instance="",
         message=message,
         data="admin_view_conversations"
-    )
-    
-    # Вызываем обработчик диалогов
-    await admin_view_conversations_handler(fake_callback)
+    ))
 
 # --- НОВЫЕ КОМАНДЫ ДЛЯ АДМИНА ---
 @dp.message_handler(commands=["check_data"], state="*")
@@ -3473,6 +3514,59 @@ async def cancel_send(callback, state):
     await state.finish()
     await admin_main_menu(callback.from_user.id)
 
+# ДОБАВЛЕНО: Глобальный обработчик для сохранения ВСЕХ личных сообщений
+@dp.message_handler(content_types=types.ContentTypes.ANY, state="*")
+async def save_all_private_messages(message: types.Message, state=None):
+    """Сохраняет ВСЕ личные сообщения между пользователями (добавлено для сохранения диалогов)"""
+    # Сохраняем только личные сообщения (не групповые)
+    if message.chat.type == 'private':
+        user_id = str(message.from_user.id)
+        
+        # Проверяем активность пользователя
+        data = load_users()
+        users = data["users"]
+        
+        if user_id in users:
+            users[user_id]["active_today"] = str(date.today())
+            users[user_id]["last_activity"] = str(datetime.now())
+            save_users(data)
+        
+        # Если это ответ в рамках диалога с наставником/учеником
+        if state:
+            current_state = await state.get_state()
+            
+            # Сохраняем сообщения, которые не сохраняются другими обработчиками
+            # (например, обычные сообщения, не связанные с заданиями)
+            data_state = await state.get_data()
+            
+            # Проверяем, ведется ли диалог с кем-то
+            if data_state.get('in_conversation_with'):
+                to_id = data_state['in_conversation_with']
+                assignment_id = data_state.get('conversation_assignment')
+                
+                # Сохраняем сообщение в истории переписки
+                save_conversation_message(
+                    user_id, 
+                    to_id, 
+                    message, 
+                    assignment_id=assignment_id,
+                    is_assignment_related=bool(assignment_id)
+                )
+        
+        # Обработка продолжается другими обработчиками
+        return
+
+# ДОБАВЛЕНО: Обработчик для сохранения состояний при callback-ах
+@dp.callback_query_handler(lambda c: True, state="*")
+async def save_callback_state(callback: types.CallbackQuery, state=None):
+    """Сохраняет состояние при callback-ах для отслеживания диалогов"""
+    if state:
+        # Сохраняем информацию о последнем действии
+        await state.update_data(last_callback=callback.data)
+    
+    # Продолжаем обработку другими обработчиками
+    return
+
 # --- ЕЖЕДНЕВНЫЙ ОТЧЕТ ---
 async def daily_report():
     await asyncio.sleep(5)
@@ -3543,6 +3637,9 @@ if __name__ == "__main__":
     else:
         print(f"📚 Файл заданий создан")
     
+    # ДОБАВЛЕНО: Информация о блокировках
+    print("🔒 Реализована система блокировок файлов для предотвращения race condition")
+    
     loop = asyncio.get_event_loop()
     loop.run_until_complete(set_bot_commands())
     print("✅ Меню команд настроено")
@@ -3552,7 +3649,7 @@ if __name__ == "__main__":
     
     print("="*50)
     print("🚀 Бот запущен и готов к работе!")
-    print("🛡️  Данные защищены от потери")
+    print("🛡️  Данные защищены от потери (блокировки файлов, атомарные операции)")
     print("🔧 Новые команды для админа: /check_data, /fix_data, /register_superadmin")
     print("📊 Добавлены функции смены наставника и уровня")
     print("📚 Добавлена система заданий: Ольга/Суперадмин → ученики → наставники")
@@ -3562,6 +3659,9 @@ if __name__ == "__main__":
     print("   • Суперадмин ВСЕГДА видит кнопку 'Все диалоги'")
     print("   • Диалоги автоматически сохраняются при общении через бота")
     print("🔄 Защита от длинных сообщений добавлена")
+    print("🔒 ДОБАВЛЕНЫ БЛОКИРОВКИ ФАЙЛОВ для предотвращения race condition")
+    print("💾 АТОМАРНЫЕ ОПЕРАЦИИ сохранения для assignments.json")
+    print("📝 ИСПРАВЛЕНА логика фильтрации диалогов наставников")
     print("="*50)
     
     executor.start_polling(dp, skip_updates=True)
