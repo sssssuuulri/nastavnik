@@ -571,7 +571,7 @@ async def admin_main_menu(user_id):
 
 # --- ОБРАБОТЧИК АДМИН-ПАНЕЛИ ---
 @dp.callback_query_handler(lambda c: c.data == "admin_panel")
-async def admin_panel_handler(callback):
+async def admin_panel_handler(callback: types.CallbackQuery):
     if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
@@ -605,14 +605,14 @@ async def admin_panel_handler(callback):
     )
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_admin_main")
-async def back_to_admin_main(callback):
+async def back_to_admin_main(callback: types.CallbackQuery):
     if callback.from_user.id in [OLGA_ID, YOUR_ADMIN_ID]:
         await admin_main_menu(callback.from_user.id)
     else:
         await callback.answer("Доступ запрещён", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_stats")
-async def admin_stats(callback):
+async def admin_stats(callback: types.CallbackQuery):
     if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
         return
     
@@ -643,7 +643,7 @@ async def admin_stats(callback):
     await callback.message.answer(text)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_activity")
-async def admin_activity(callback):
+async def admin_activity(callback: types.CallbackQuery):
     if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
         return
     
@@ -672,7 +672,7 @@ async def admin_activity(callback):
     await safe_send_message(callback.from_user.id, text)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_new_today")
-async def admin_new_today(callback):
+async def admin_new_today(callback: types.CallbackQuery):
     if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
         return
     
@@ -704,7 +704,7 @@ async def admin_new_today(callback):
     await safe_send_message(callback.from_user.id, text)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_search")
-async def admin_search(callback):
+async def admin_search(callback: types.CallbackQuery):
     if callback.from_user.id != YOUR_ADMIN_ID:
         await callback.answer("Доступ только для суперадмина", show_alert=True)
         return
@@ -716,9 +716,14 @@ async def admin_search(callback):
 @dp.callback_query_handler(lambda c: c.data == "admin_view_conversations")
 async def admin_view_conversations_handler(callback: types.CallbackQuery):
     """Просмотр всех диалогов в системе"""
-    if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
+    user_id = callback.from_user.id
+    
+    if user_id not in [OLGA_ID, YOUR_ADMIN_ID]:
         await callback.answer("Доступ только для администраторов", show_alert=True)
         return
+    
+    # Показываем сообщение о загрузке
+    await callback.answer("🔄 Загружаю диалоги...", show_alert=False)
     
     # Загружаем данные
     assignments_data = load_assignments()
@@ -727,16 +732,21 @@ async def admin_view_conversations_handler(callback: types.CallbackQuery):
     conversations = assignments_data.get("conversations", {})
     
     if not conversations:
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="admin_view_conversations"))
+        kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_to_admin_main"))
+        
         await callback.message.answer(
             "💬 <b>Все диалоги в системе</b>\n\n"
             "Пока нет сохраненных диалогов.\n\n"
             "<i>Диалоги автоматически сохраняются при общении через бота</i>",
+            reply_markup=kb,
             parse_mode="HTML"
         )
         return
     
     # Разная логика для суперадмина и Ольги
-    if callback.from_user.id == YOUR_ADMIN_ID:
+    if user_id == YOUR_ADMIN_ID:
         # СУПЕРАДМИН: видит ВСЕ диалоги
         await superadmin_view_all_conversations(callback, conversations, users_data)
     else:
@@ -745,10 +755,6 @@ async def admin_view_conversations_handler(callback: types.CallbackQuery):
 
 async def superadmin_view_all_conversations(callback: types.CallbackQuery, conversations, users_data):
     """Суперадмин видит ВСЕ диалоги"""
-    if callback.from_user.id != YOUR_ADMIN_ID:
-        await callback.answer("Доступ только для суперадмина", show_alert=True)
-        return
-    
     # Группируем диалоги по парам пользователей
     conversation_pairs = {}
     
@@ -784,7 +790,7 @@ async def superadmin_view_all_conversations(callback: types.CallbackQuery, conve
     # Сортируем по последнему сообщению (новые сначала)
     sorted_pairs = sorted(
         conversation_pairs.values(), 
-        key=lambda x: x["last_message"], 
+        key=lambda x: x.get("last_message", ""), 
         reverse=True
     )
     
@@ -841,7 +847,7 @@ async def superadmin_view_all_conversations(callback: types.CallbackQuery, conve
     await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 async def admin_view_mentor_conversations(callback: types.CallbackQuery, conversations, users_data):
-    """Ольга видит только диалоги наставников с учениками (ИСПРАВЛЕНО)"""
+    """Ольга видит только диалоги наставников с учениками"""
     # Группируем диалоги по парам наставник-ученик
     conversation_pairs = {}
     
@@ -849,16 +855,14 @@ async def admin_view_mentor_conversations(callback: types.CallbackQuery, convers
         from_id = msg["from_user_id"]
         to_id = msg["to_user_id"]
         
-        # ИСПРАВЛЕННАЯ ПРОВЕРКА: проверяем в обе стороны
+        # Определяем, кто наставник, а кто ученик
         from_user = users_data.get(from_id, {})
         to_user = users_data.get(to_id, {})
         
-        # Определяем, кто наставник, а кто ученик (исправленная логика)
         is_mentor_student_pair = False
         mentor_id = None
         student_id = None
         
-        # Важно: проверяем ОБА направления отношений
         if from_user.get("mentor") == to_id:
             mentor_id = to_id
             student_id = from_id
@@ -890,10 +894,15 @@ async def admin_view_mentor_conversations(callback: types.CallbackQuery, convers
         conversation_pairs[pair_key]["message_count"] += 1
     
     if not conversation_pairs:
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="admin_view_conversations"))
+        kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_to_admin_main"))
+        
         await callback.message.answer(
             "💬 <b>Диалоги наставников с учениками</b>\n\n"
             "Пока нет сохраненных диалогов между наставниками и учениками.\n\n"
             "<i>Диалоги автоматически сохраняются, когда наставники общаются с учениками через бота</i>",
+            reply_markup=kb,
             parse_mode="HTML"
         )
         return
@@ -901,7 +910,7 @@ async def admin_view_mentor_conversations(callback: types.CallbackQuery, convers
     # Сортируем по последнему сообщению (новые сначала)
     sorted_pairs = sorted(
         conversation_pairs.values(), 
-        key=lambda x: x["last_message"], 
+        key=lambda x: x.get("last_message", ""), 
         reverse=True
     )
     
@@ -1015,7 +1024,7 @@ async def admin_view_mentor_conversations_only_handler(callback: types.CallbackQ
         return
     
     # Сортируем по последнему сообщению
-    sorted_pairs = sorted(conversation_pairs.values(), key=lambda x: x["last_message"], reverse=True)
+    sorted_pairs = sorted(conversation_pairs.values(), key=lambda x: x.get("last_message", ""), reverse=True)
     
     text = f"👨‍🏫 <b>Диалоги наставников с учениками</b>\n\n"
     text += f"Всего диалогов: {len(sorted_pairs)}\n\n"
@@ -1213,14 +1222,20 @@ async def dialogs_command(message: types.Message, state=None):
     if state:
         await state.finish()
     
-    # Перенаправляем на обработчик просмотра диалогов
-    await admin_view_conversations_handler(types.CallbackQuery(
+    # Создаем fake callback для обработки
+    from aiogram.types import CallbackQuery
+    
+    # Создаем поддельный callback объект
+    fake_callback = CallbackQuery(
         id="dialogs_command",
         from_user=message.from_user,
         chat_instance="",
         message=message,
         data="admin_view_conversations"
-    ))
+    )
+    
+    # Вызываем обработчик
+    await admin_view_conversations_handler(fake_callback)
 
 # --- НОВЫЕ КОМАНДЫ ДЛЯ АДМИНА ---
 @dp.message_handler(commands=["check_data"], state="*")
@@ -1803,7 +1818,7 @@ async def choose_mentor(callback, state):
 
 # --- Подтверждение наставником ---
 @dp.callback_query_handler(lambda c: c.data.startswith("mentor_accept:"))
-async def mentor_accept(callback):
+async def mentor_accept(callback: types.CallbackQuery):
     chosen_user_id = callback.data.split(":")[1]
 
     data = load_users()
@@ -1830,7 +1845,7 @@ async def mentor_accept(callback):
     await bot.send_message(chosen_user_id, "Наставник подтвердил ваш выбор ✅")
 
 @dp.callback_query_handler(lambda c: c.data.startswith("mentor_decline:"))
-async def mentor_decline(callback):
+async def mentor_decline(callback: types.CallbackQuery):
     chosen_user_id = callback.data.split(":")[1]
     data = load_users()
     users = data["users"]
@@ -1846,7 +1861,7 @@ async def mentor_decline(callback):
 
 # --- ИЗМЕНЕНИЕ НАСТАВНИКА ---
 @dp.callback_query_handler(lambda c: c.data == "change_mentor_btn")
-async def change_mentor_btn(callback):
+async def change_mentor_btn(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
     data = load_users()
     users = data["users"]
@@ -1877,7 +1892,7 @@ async def change_mentor_btn(callback):
     await callback.message.answer("Выберите уровень наставника (только равный или выше вашего текущего уровня):", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("change_mentor_level:"), state=Form.change_mentor)
-async def change_mentor_level(callback, state):
+async def change_mentor_level(callback: types.CallbackQuery, state):
     level = callback.data.split(":")[1]
     await state.update_data(new_mentor_level=level)
     
@@ -1913,7 +1928,7 @@ async def change_mentor_level(callback, state):
     await callback.message.delete()
 
 @dp.callback_query_handler(lambda c: c.data.startswith("select_new_mentor:"), state=Form.change_mentor)
-async def select_new_mentor(callback, state):
+async def select_new_mentor(callback: types.CallbackQuery, state):
     new_mentor_id = callback.data.split(":")[1]
     user_id = str(callback.from_user.id)
     
@@ -1951,7 +1966,7 @@ async def select_new_mentor(callback, state):
     await state.finish()
 
 @dp.callback_query_handler(lambda c: c.data.startswith("accept_new_mentor:"))
-async def accept_new_mentor(callback):
+async def accept_new_mentor(callback: types.CallbackQuery):
     user_id = callback.data.split(":")[1]
     new_mentor_id = str(callback.from_user.id)
     
@@ -1996,7 +2011,7 @@ async def accept_new_mentor(callback):
     log_info(f"Пользователь {user_id} ({user_name}) сменил наставника с {old_mentor_id} на {new_mentor_id}")
 
 @dp.callback_query_handler(lambda c: c.data.startswith("decline_new_mentor:"))
-async def decline_new_mentor(callback):
+async def decline_new_mentor(callback: types.CallbackQuery):
     user_id = callback.data.split(":")[1]
     declined_mentor_id = str(callback.from_user.id)
     
@@ -2031,7 +2046,7 @@ async def decline_new_mentor(callback):
 
 # --- ИЗМЕНЕНИЕ УРОВНЯ ---
 @dp.callback_query_handler(lambda c: c.data == "change_level_btn")
-async def change_level_btn(callback):
+async def change_level_btn(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
     data = load_users()
     users = data["users"]
@@ -2059,7 +2074,7 @@ async def change_level_btn(callback):
     await callback.message.answer(f"Ваш текущий уровень: <b>{current_level}</b>\nВыберите новый уровень:", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("select_new_level:"), state=Form.change_level)
-async def select_new_level(callback, state):
+async def select_new_level(callback: types.CallbackQuery, state):
     new_level = callback.data.split(":")[1]
     user_id = str(callback.from_user.id)
     
@@ -2110,7 +2125,7 @@ async def select_new_level(callback, state):
     await state.finish()
 
 @dp.callback_query_handler(lambda c: c.data.startswith("confirm_level:"))
-async def confirm_level(callback):
+async def confirm_level(callback: types.CallbackQuery):
     parts = callback.data.split(":")
     user_id = parts[1]
     new_level = parts[2]
@@ -2154,7 +2169,7 @@ async def confirm_level(callback):
     log_info(f"Пользователь {user_id} ({user_name}) сменил уровень с {old_level} на {new_level}")
 
 @dp.callback_query_handler(lambda c: c.data.startswith("reject_level:"))
-async def reject_level(callback):
+async def reject_level(callback: types.CallbackQuery):
     user_id = callback.data.split(":")[1]
     mentor_id = str(callback.from_user.id)
     
@@ -2190,14 +2205,14 @@ async def reject_level(callback):
 
 # --- ОБЩИЙ ОБРАБОТЧИК ОТМЕНЫ ---
 @dp.callback_query_handler(lambda c: c.data == "cancel_change", state=[Form.change_level, Form.change_mentor])
-async def cancel_change(callback, state):
+async def cancel_change(callback: types.CallbackQuery, state):
     await state.finish()
     await callback.message.answer("❌ Изменение отменено.")
     await callback.message.delete()
 
 # --- Кнопка "Мой профиль" ---
 @dp.callback_query_handler(lambda c: c.data == "my_profile")
-async def show_my_profile(callback):
+async def show_my_profile(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
     data = load_users()
     users = data["users"]
@@ -2245,7 +2260,7 @@ async def show_my_profile(callback):
 
 # --- Меню "Мои ученики" ---
 @dp.callback_query_handler(lambda c: c.data == "show_my_students")
-async def my_students(callback):
+async def my_students(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     data = load_users()
     users = data["users"]
@@ -2285,7 +2300,7 @@ async def my_students(callback):
         await callback.message.answer("У вас пока нет учеников.", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data == "back_main")
-async def back_main(callback):
+async def back_main(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     
     # СУПЕРАДМИН всегда получает админ-меню
@@ -2305,7 +2320,7 @@ async def back_main(callback):
                 await callback.message.answer("📋 <b>Главное меню</b>", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("show_students:"))
-async def show_students(callback):
+async def show_students(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     level = callback.data.split(":")[1]
 
@@ -2355,7 +2370,7 @@ async def show_students(callback):
     await callback.message.answer(text, reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data == "my_full_branch")
-async def my_full_branch(callback):
+async def my_full_branch(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
     
     if callback.from_user.id == YOUR_ADMIN_ID:
@@ -2427,7 +2442,7 @@ async def my_full_branch(callback):
     await safe_send_message(callback.from_user.id, text, reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("branch_level:"))
-async def branch_level_detail(callback):
+async def branch_level_detail(callback: types.CallbackQuery):
     user_id = str(callback.from_user.id)
     selected_level = callback.data.split(":")[1]
     
@@ -2490,7 +2505,7 @@ async def branch_level_detail(callback):
     await safe_send_message(callback.from_user.id, text, reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("student_profile:"))
-async def student_profile(callback):
+async def student_profile(callback: types.CallbackQuery):
     parts = callback.data.split(":")
     user_id = parts[1]
     source = parts[2] if len(parts) > 2 else "NONE"
@@ -2528,7 +2543,7 @@ async def student_profile(callback):
     )
 
 @dp.callback_query_handler(lambda c: c.data.startswith("child_students:"))
-async def child_students(callback):
+async def child_students(callback: types.CallbackQuery):
     user_id = callback.data.split(":")[1]
 
     data = load_users()
@@ -2553,7 +2568,7 @@ async def child_students(callback):
 
 # --- ВСЕ ПОЛЬЗОВАТЕЛИ ---
 @dp.callback_query_handler(lambda c: c.data == "all_users")
-async def all_users(callback):
+async def all_users(callback: types.CallbackQuery):
     if callback.from_user.id != YOUR_ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
@@ -2587,7 +2602,7 @@ async def all_users(callback):
 
 # --- ПОЛНАЯ ИЕРАРХИЯ ---
 @dp.callback_query_handler(lambda c: c.data == "full_hierarchy")
-async def full_hierarchy(callback):
+async def full_hierarchy(callback: types.CallbackQuery):
     if callback.from_user.id != YOUR_ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
@@ -2621,7 +2636,7 @@ async def full_hierarchy(callback):
 
 # --- РАССЫЛКА ---
 @dp.callback_query_handler(lambda c: c.data == "admin_broadcast")
-async def admin_broadcast(callback):
+async def admin_broadcast(callback: types.CallbackQuery):
     if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
@@ -2645,7 +2660,7 @@ async def admin_broadcast(callback):
         await show_level_selection(callback.message, [])
 
 @dp.callback_query_handler(lambda c: c.data == "broadcast_by_level")
-async def broadcast_by_level(callback):
+async def broadcast_by_level(callback: types.CallbackQuery):
     if callback.from_user.id not in [OLGA_ID, YOUR_ADMIN_ID]:
         return
     
@@ -2662,7 +2677,7 @@ async def show_level_selection(message, selected_levels):
     await message.answer("Выберите уровни (отметка ✅ — выбранные):", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("lvl_select:"), state=Form.admin_choose_levels)
-async def lvl_select(callback, state):
+async def lvl_select(callback: types.CallbackQuery, state):
     lvl = callback.data.split(":")[1]
     data = await state.get_data()
     selected = data.get("selected_levels", [])
@@ -2675,7 +2690,7 @@ async def lvl_select(callback, state):
     await show_level_selection(callback.message, selected)
 
 @dp.callback_query_handler(lambda c: c.data == "lvl_done", state=Form.admin_choose_levels)
-async def lvl_done(callback, state):
+async def lvl_done(callback: types.CallbackQuery, state):
     data = await state.get_data()
     selected_levels = data.get("selected_levels", [])
     if not selected_levels:
@@ -2686,7 +2701,7 @@ async def lvl_done(callback, state):
     await Form.admin_message.set()
 
 @dp.callback_query_handler(lambda c: c.data == "broadcast_all")
-async def broadcast_all(callback):
+async def broadcast_all(callback: types.CallbackQuery):
     if callback.from_user.id != YOUR_ADMIN_ID:
         return
     
@@ -2708,7 +2723,7 @@ async def broadcast_all(callback):
     )
 
 @dp.callback_query_handler(lambda c: c.data == "confirm_broadcast_all")
-async def confirm_broadcast_all(callback):
+async def confirm_broadcast_all(callback: types.CallbackQuery):
     await callback.message.edit_text("Отправьте сообщение для рассылки ВСЕМ пользователям:")
     await Form.admin_message.set()
     
@@ -2716,7 +2731,7 @@ async def confirm_broadcast_all(callback):
     await state.update_data(broadcast_to_all=True)
 
 @dp.callback_query_handler(lambda c: c.data == "cancel_broadcast")
-async def cancel_broadcast(callback):
+async def cancel_broadcast(callback: types.CallbackQuery):
     await callback.message.edit_text("❌ Рассылка отменена.")
     await admin_main_menu(callback.from_user.id)
 
@@ -3467,7 +3482,7 @@ async def check_assignment_status(callback: types.CallbackQuery):
 
 # --- ОБЫЧНАЯ РАССЫЛКА ---
 @dp.callback_query_handler(lambda c: c.data == "confirm_send", state=Form.admin_message)
-async def confirm_send(callback, state):
+async def confirm_send(callback: types.CallbackQuery, state):
     data = await state.get_data()
     message = data.get("message_to_send")
     recipients = data.get("recipients", [])
@@ -3509,7 +3524,7 @@ async def confirm_send(callback, state):
     await admin_main_menu(callback.from_user.id)
 
 @dp.callback_query_handler(lambda c: c.data == "cancel_send", state=Form.admin_message)
-async def cancel_send(callback, state):
+async def cancel_send(callback: types.CallbackQuery, state):
     await callback.message.edit_text("❌ Рассылка отменена.")
     await state.finish()
     await admin_main_menu(callback.from_user.id)
